@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from cryptography.fernet import Fernet
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+# Fix for web3.py >= v6
+try:
+    from web3.middleware import geth_poa_middleware
+except ImportError:
+    from web3.middleware.geth_poa import geth_poa_middleware
 from eth_account import Account
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
@@ -221,12 +225,7 @@ def get_token_balance(address):
         return 0
 
 def get_token_price():
-    # Simplified: get from pool via w3 calls or use DexScreener API.
-    # For demo, return a dummy or fetch via Uniswap V3 slot0.
-    # We'll implement a real call to the pool.
-    # Assuming we know the pool address for ERROR/ETH.
-    # For now, return a placeholder from the welcome screen.
-    # We'll hardcode for demo – in production use DexScreener or direct pool query.
+    # Placeholder – implement real price fetch from Uniswap V3 pool
     return 0.000002117
 
 def get_24h_stats():
@@ -243,9 +242,6 @@ def get_24h_stats():
     }
 
 def build_buy_transaction(user_address, amount_eth_wei, token_out_address, slippage=SLIPPAGE_DEFAULT):
-    # For Robinhood Chain, WETH is likely the same as ETH
-    # But we need the WETH address for the router
-    # We'll assume WETH_ADDRESS is set
     deadline = int(datetime.utcnow().timestamp()) + 1200
     amount_out_min = 0  # in production calculate with slippage
     params = {
@@ -268,7 +264,7 @@ def build_buy_transaction(user_address, amount_eth_wei, token_out_address, slipp
     return txn
 
 def build_sell_transaction(user_address, token_in_address, amount_token_wei, slippage=SLIPPAGE_DEFAULT):
-    # First need to approve
+    # First approve the router to spend tokens
     approve_txn = token_contract.functions.approve(SWAP_ROUTER, amount_token_wei).build_transaction({
         'from': user_address,
         'nonce': w3.eth.get_transaction_count(user_address),
@@ -358,7 +354,6 @@ async def continue_onboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send wallet info and main menu
     wallet = user.wallet_address
     enc_pvk = user.encrypted_private_key
-    # DM private key (warning)
     await query.edit_message_text(f"Your wallet has been generated!\nAddress: `{wallet}`\n\n⚠️ **IMPORTANT**: Your private key is encrypted in our database. Please back it up now:\n\n`{enc_pvk}`\n\nKeep this safe! We cannot recover it.")
     # Now show main menu
     await show_main_menu(query.message.chat_id, context)
@@ -414,7 +409,6 @@ async def buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount_eth = float(update.message.text)
         context.user_data['buy_eth'] = amount_eth
-        # Simulate price
         price = get_token_price()
         expected_tokens = amount_eth / price
         slippage = context.user_data.get('slippage', SLIPPAGE_DEFAULT)
@@ -448,10 +442,8 @@ async def buy_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         signed = w3.eth.account.sign_transaction(txn, private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction)
         await update.message.reply_text(f"✅ Buy order submitted! TX: {EXPLORER_URL}/tx/{tx_hash.hex()}")
-        # Broadcast to group if enabled
         if context.user_data.get('broadcast', True):
             await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=f"🟢 @{update.effective_user.username} bought {amount_eth} ETH worth of $ERROR! TX: {EXPLORER_URL}/tx/{tx_hash.hex()}")
-        # Save transaction
         session = SessionLocal()
         tx_record = Transaction(wallet_address=user.wallet_address, tx_hash=tx_hash.hex(), tx_type='buy', amount=str(amount_eth), token_symbol='ERROR', token_contract=CONTRACT_ADDRESS, broadcasted=True)
         session.add(tx_record)
@@ -560,10 +552,9 @@ async def dca_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = context.user_data['dca_total']
         intervals = context.user_data['dca_intervals']
         amount_per = total / intervals
-        # Schedule buys using apscheduler
         scheduler = context.application.scheduler
         for i in range(intervals):
-            delay = i * minutes * 60  # seconds
+            delay = i * minutes * 60
             scheduler.add_job(execute_dca_buy, 'date', run_date=datetime.utcnow() + timedelta(seconds=delay), args=[update.effective_user.id, amount_per, context])
         await update.message.reply_text(f"✅ DCA scheduled: {intervals} buys of {amount_per:.6f} ETH every {minutes} minutes.")
     except Exception as e:
@@ -571,16 +562,18 @@ async def dca_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def execute_dca_buy(user_id, amount_eth, context):
-    # Similar to buy execution but without user interaction
-    # For brevity, we'll implement a simplified version
-    pass
+    # Simplified DCA buy – you'd need to fetch user wallet and execute a buy
+    # For brevity, we'll just log
+    logger.info(f"DCA buy for user {user_id}: {amount_eth} ETH")
 
 # ─── Limit Orders ───
 async def start_limit_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['limit_type'] = 'buy'
     await update.message.reply_text("Enter target price per $ERROR (in ETH):")
     return LIMIT_PRICE
 
 async def start_limit_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['limit_type'] = 'sell'
     await update.message.reply_text("Enter target price per $ERROR (in ETH):")
     return LIMIT_PRICE
 
@@ -615,7 +608,6 @@ async def limit_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     price = context.user_data['limit_price']
     amount = context.user_data['limit_amount']
-    # Determine type from previous command (buy or sell)
     order_type = context.user_data.get('limit_type', 'buy')
     session = SessionLocal()
     order = LimitOrder(user_id=str(tg_id), type=order_type, token_address=CONTRACT_ADDRESS, amount=str(amount), price_target=price)
@@ -654,7 +646,7 @@ async def show_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Holder Top 10 ───
 async def show_holders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Simulate top holders – in production call a blockchain explorer API
+    # Placeholder – you should fetch from Blockscout API or contract
     holders = [
         ("0x1234...5678", 10000),
         ("0xabcd...efgh", 8000),
@@ -674,7 +666,6 @@ async def show_holders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Monitor Toggle ───
 async def toggle_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Simple toggle stored in user_data for demo
     current = context.user_data.get('monitor', False)
     context.user_data['monitor'] = not current
     status = "ON" if context.user_data['monitor'] else "OFF"
@@ -757,16 +748,12 @@ async def set_price_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Background Tasks ───
 async def monitor_orders(context: ContextTypes.DEFAULT_TYPE):
-    # Check pending limit orders against current price
     session = SessionLocal()
     orders = session.query(LimitOrder).filter(LimitOrder.status == 'pending').all()
     current_price = get_token_price()
     for order in orders:
         if order.type == 'buy' and current_price <= order.price_target:
-            # Execute buy
-            # (simplified)
             session.query(LimitOrder).filter(LimitOrder.id == order.id).update({'status': 'executed'})
-            # Notify user
             try:
                 await context.bot.send_message(chat_id=int(order.user_id), text=f"🔔 Your buy limit order at {order.price_target} executed!")
             except:
@@ -801,7 +788,6 @@ async def monitor_price_alerts(context: ContextTypes.DEFAULT_TYPE):
     session.close()
 
 async def hourly_pulse(context: ContextTypes.DEFAULT_TYPE):
-    # Post to group
     stats = get_24h_stats()
     text = f"📊 **Error404 Chain Pulse**\n\nLast hour: ... (simulated)\nPrice: ${stats['price']:.10f}\n24h Volume: ${stats['volume_24h']:.2f}\nBuys: {stats['buys_24h']} | Sells: {stats['sells_24h']}"
     await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown")
@@ -825,7 +811,7 @@ def main():
 
     # Conversation handlers
     conv_buy = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Buy \$ERROR$"), start_buy)],
+        entry_points=[MessageHandler(filters.Regex(r"^Buy \$ERROR$"), start_buy)],
         states={
             BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_amount)],
             BUY_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, buy_confirm)],
@@ -833,7 +819,7 @@ def main():
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Cancelled."))]
     )
     conv_sell = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Sell \$ERROR$"), start_sell)],
+        entry_points=[MessageHandler(filters.Regex(r"^Sell \$ERROR$"), start_sell)],
         states={
             SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
             SELL_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_confirm)],
@@ -841,7 +827,7 @@ def main():
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Cancelled."))]
     )
     conv_dca = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^DCA$"), start_dca)],
+        entry_points=[MessageHandler(filters.Regex(r"^DCA$"), start_dca)],
         states={
             DCA_TOTAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, dca_total)],
             DCA_INTERVALS: [MessageHandler(filters.TEXT & ~filters.COMMAND, dca_intervals)],
@@ -850,7 +836,7 @@ def main():
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Cancelled."))]
     )
     conv_limit_buy = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Buy Limit$"), start_limit_buy)],
+        entry_points=[MessageHandler(filters.Regex(r"^Buy Limit$"), start_limit_buy)],
         states={
             LIMIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_price)],
             LIMIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_amount)],
@@ -859,7 +845,7 @@ def main():
         fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Cancelled."))]
     )
     conv_limit_sell = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^Sell Limit$"), start_limit_sell)],
+        entry_points=[MessageHandler(filters.Regex(r"^Sell Limit$"), start_limit_sell)],
         states={
             LIMIT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_price)],
             LIMIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, limit_amount)],
@@ -875,7 +861,7 @@ def main():
     application.add_handler(conv_dca)
     application.add_handler(conv_limit_buy)
     application.add_handler(conv_limit_sell)
-    application.add_handler(MessageHandler(filters.Regex("^(Buy \$ERROR|Sell \$ERROR|DCA|Buy Limit|Sell Limit|Wallet|Portfolio|Holder Top 10|Monitor|Refer|Settings|Help)$"), handle_buttons))
+    application.add_handler(MessageHandler(filters.Regex(r"^(Buy \$ERROR|Sell \$ERROR|DCA|Buy Limit|Sell Limit|Wallet|Portfolio|Holder Top 10|Monitor|Refer|Settings|Help)$"), handle_buttons))
     application.add_handler(CommandHandler("alert", set_price_alert))
     application.add_handler(CommandHandler("slippage", set_slippage))
     application.add_handler(CommandHandler("broadcast", set_broadcast))
