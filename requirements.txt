@@ -1,9 +1,8 @@
-python-telegram-bot==21.6
-web3==7.4.0
-eth-account==0.13.4
-cryptography==43.0.3
-SQLAlchemy==2.0.36
-psycopg2-binary==2.9.10
-Flask==3.0.3
-httpx==0.27.2
-python-dotenv==1.0.1
+python-telegram-bot>=20.0
+web3>=6.0
+cryptography
+sqlalchemy
+apscheduler
+flask
+python-dotenv
+eth-account
