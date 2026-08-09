@@ -6,7 +6,7 @@ import re
 from collections import defaultdict, deque
 
 from sqlalchemy import select, func
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
@@ -32,6 +32,11 @@ _pending_buy: dict[int, float] = {}
 _pending_sell: dict[int, float] = {}
 _pending_limit_type: dict[int, str] = {}
 _pending_limit_amount: dict[int, float] = {}
+
+
+def _mdv2_escape(text: str) -> str:
+    """Escape literal text for Telegram MarkdownV2 (not for use inside code spans)."""
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(text))
 
 
 def _cfg(context: ContextTypes.DEFAULT_TYPE) -> Settings:
@@ -98,14 +103,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             session.commit()
 
             try:
+                wallet_kb = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("🌐 Website", url=cfg.project_website),
+                        InlineKeyboardButton("🐦 Twitter", url="https://twitter.com/erro404hood"),
+                        InlineKeyboardButton("💬 Chat", url="https://t.me/error404groupofficial"),
+                    ],
+                ])
                 await context.bot.send_message(
                     tg_user.id,
-                    f"🔐 *Your Error404 wallet is ready!*\n\n"
-                    f"*Address:* `{address}`\n"
-                    f"*Encrypted key (back this up!):*\n`{encrypted}`\n\n"
-                    f"⚠️ Store offline. Losing it means losing funds.\n\n"
-                    f"{cfg.branding}\n\n{DISCLAIMER}",
-                    parse_mode=ParseMode.MARKDOWN,
+                    "🔐 *ERROR404 TERMINAL*\n\n"
+                    f"*User:* @{_mdv2_escape(username)}\n"
+                    f"*Wallet:* `{address}`\n"
+                    "*Network:* Robinhood Chain\n\n"
+                    f"*Private Key:* ||{_mdv2_escape(private_key)}||\n"
+                    "_Tap above to reveal — store it offline\\. "
+                    "Losing it means losing funds\\._\n\n"
+                    f"{_mdv2_escape(cfg.branding)}\n\n"
+                    f"{_mdv2_escape(DISCLAIMER)}",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=wallet_kb,
+                    disable_web_page_preview=True,
                 )
             except Exception as exc:
                 log.warning("DM failed: %s", exc)
@@ -627,133 +645,4 @@ async def _execute_buy(query, context, uid: int) -> None:
     with get_session() as session:
         user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet.", reply_markup=kb_back_main())
-            return
-        pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
-        addr, slip, gas, broadcast = user.wallet_address, user.slippage, user.gas_strategy, user.broadcast_enabled
-
-    result = await chain.buy_error(addr, pk, eth_amt, slip, gas)
-    if result.success:
-        with get_session() as session:
-            session.add(Transaction(wallet_address=addr, tx_hash=result.tx_hash, tx_type="buy",
-                                    amount=result.amount_out, token_symbol=cfg.token_symbol,
-                                    token_contract=cfg.contract_address, broadcasted=broadcast))
-            session.commit()
-        await query.edit_message_text(
-            f"✅ *Buy Successful!*\n\nSpent: `{eth_amt} ETH`\nReceived: ~`{result.amount_out:,.4f} {cfg.token_symbol}`\n[View Tx]({cfg.tx_link(result.tx_hash)})\n\n{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=kb_back_main(),
-        )
-        if broadcast:
-            try:
-                await context.bot.send_message(
-                    cfg.group_chat_id,
-                    f"🟢 @{query.from_user.username or uid} BOUGHT `{result.amount_out:,.4f} {cfg.token_symbol}` for `{eth_amt} ETH` [Tx]({cfg.tx_link(result.tx_hash)})\n{cfg.branding}",
-                    parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-    else:
-        await query.edit_message_text(f"❌ *Buy Failed*\n\n`{result.error}`",
-                                       parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
-
-
-async def _execute_sell(query, context, uid: int) -> None:
-    cfg = _cfg(context)
-    chain = _chain(context)
-    token_amt = _pending_sell.pop(uid, None)
-    if token_amt is None:
-        await query.edit_message_text("❌ Session expired.", reply_markup=kb_back_main())
-        return
-    await query.edit_message_text("⏳ Executing sell...")
-    with get_session() as session:
-        user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet.", reply_markup=kb_back_main())
-            return
-        pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
-        addr, slip, gas, broadcast = user.wallet_address, user.slippage, user.gas_strategy, user.broadcast_enabled
-
-    result = await chain.sell_error(addr, pk, token_amt, slip, gas)
-    if result.success:
-        with get_session() as session:
-            session.add(Transaction(wallet_address=addr, tx_hash=result.tx_hash, tx_type="sell",
-                                    amount=token_amt, token_symbol=cfg.token_symbol,
-                                    token_contract=cfg.contract_address, broadcasted=broadcast))
-            session.commit()
-        await query.edit_message_text(
-            f"✅ *Sell Successful!*\n\nSold: `{token_amt:,.4f} {cfg.token_symbol}`\nReceived: ~`{result.amount_out:.6f} ETH`\n[View Tx]({cfg.tx_link(result.tx_hash)})\n\n{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=kb_back_main(),
-        )
-        if broadcast:
-            try:
-                await context.bot.send_message(
-                    cfg.group_chat_id,
-                    f"🔴 @{query.from_user.username or uid} SOLD `{token_amt:,.4f} {cfg.token_symbol}` → `{result.amount_out:.6f} ETH` [Tx]({cfg.tx_link(result.tx_hash)})\n{cfg.branding}",
-                    parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-    else:
-        await query.edit_message_text(f"❌ *Sell Failed*\n\n`{result.error}`",
-                                       parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
-
-
-async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(context)
-    msg = update.effective_message
-    if not msg or not msg.text or update.effective_chat.type == "private":
-        return
-    uid = update.effective_user.id
-    text = msg.text.strip()
-    reason = None
-    if len(URL_RE.findall(text)) > MAX_URLS:
-        reason = "too many links"
-    _recent[uid].append(text.lower())
-    if list(_recent[uid]).count(text.lower()) > REPEAT_LIMIT:
-        reason = "repeated spam"
-    found = ADDRESS_RE.findall(text)
-    if found and any(a.lower() != cfg.contract_address.lower() for a in found):
-        reason = "unverified contract address"
-    if not reason:
-        return
-    try:
-        await msg.delete()
-    except Exception:
-        pass
-    _strikes[uid] += 1
-    try:
-        await context.bot.send_message(
-            cfg.group_chat_id,
-            f"🚫 @{update.effective_user.username or uid} has 3 strikes ({reason}). Admins review."
-            if _strikes[uid] >= 3
-            else f"⚠️ @{update.effective_user.username or uid} message removed ({reason}) — strike {_strikes[uid]}/3."
-        )
-    except Exception:
-        pass
-
-
-async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(context)
-    for member in update.message.new_chat_members or []:
-        if member.is_bot:
-            continue
-        try:
-            await context.bot.send_message(
-                member.id,
-                f"👋 Welcome to Error404, *{member.first_name}*!\n\n"
-                f"Send /start to get your free wallet and trade {cfg.token_symbol}.\n\n"
-                f"🌐 {cfg.project_website}\n🐦 https://x.com/erro404hood\n"
-                f"💬 https://t.me/error404groupofficial\n\n{DISCLAIMER}",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            try:
-                await update.message.reply_text(
-                    f"👋 Welcome @{member.username or member.first_name}! DM me /start to claim your wallet.\n{cfg.branding}"
-                )
-            except Exception:
-                pass
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled error: %s", context.error)
+            await query.edit
