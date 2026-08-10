@@ -6,8 +6,8 @@ import logging
 from contextlib import contextmanager
 
 from sqlalchemy import (
-    BigInteger, Boolean, DateTime, Float, ForeignKey,
-    Integer, String, create_engine,
+    BigInteger, Boolean, DateTime, Float,
+    ForeignKey, Integer, String, create_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -29,6 +29,8 @@ class User(Base):
     join_date: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     referral_code: Mapped[str] = mapped_column(String(16), unique=True)
     referred_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    # Settings
     monitor_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     broadcast_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     slippage: Mapped[float] = mapped_column(Float, default=1.0)
