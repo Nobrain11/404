@@ -1,0 +1,11 @@
+{
+  "name": "error404-telegram-bot",
+  "private": true,
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.34.3",
+  "scripts": {
+    "build": "python -m venv .venv && .venv/bin/python -m pip install -q -r requirements.txt && .venv/bin/python -m compileall -q .",
+    "start": ".venv/bin/python main.py",
+    "dev": "python -m venv .venv && .venv/bin/python -m pip install -q -r requirements.txt && .venv/bin/python main.py"
+  }
+}
