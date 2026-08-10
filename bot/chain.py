@@ -14,14 +14,14 @@ from .http_utils import run_sync_retry
 log = logging.getLogger(__name__)
 
 ERC20_ABI = [
-    {"constant": True,  "inputs": [],                                        "name": "decimals",    "outputs": [{"name": "", "type": "uint8"}],   "type": "function"},
-    {"constant": True,  "inputs": [],                                        "name": "symbol",      "outputs": [{"name": "", "type": "string"}],  "type": "function"},
-    {"constant": True,  "inputs": [],                                        "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
-    {"constant": True,  "inputs": [{"name": "owner",   "type": "address"}], "name": "balanceOf",   "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+    {"constant": True,  "inputs": [],                                         "name": "decimals",    "outputs": [{"name": "", "type": "uint8"}],   "type": "function"},
+    {"constant": True,  "inputs": [],                                         "name": "symbol",      "outputs": [{"name": "", "type": "string"}],  "type": "function"},
+    {"constant": True,  "inputs": [],                                         "name": "totalSupply", "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+    {"constant": True,  "inputs": [{"name": "owner",   "type": "address"}],  "name": "balanceOf",   "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
     {"constant": False, "inputs": [{"name": "spender", "type": "address"},
-                                    {"name": "amount",  "type": "uint256"}], "name": "approve",     "outputs": [{"name": "", "type": "bool"}],    "type": "function"},
+                                    {"name": "amount",  "type": "uint256"}],  "name": "approve",     "outputs": [{"name": "", "type": "bool"}],    "type": "function"},
     {"constant": True,  "inputs": [{"name": "owner",   "type": "address"},
-                                    {"name": "spender", "type": "address"}], "name": "allowance",   "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
+                                    {"name": "spender", "type": "address"}],  "name": "allowance",   "outputs": [{"name": "", "type": "uint256"}], "type": "function"},
     {
         "anonymous": False,
         "inputs": [
@@ -55,13 +55,13 @@ POOL_ABI = [
     {
         "inputs": [], "name": "slot0",
         "outputs": [
-            {"name": "sqrtPriceX96",              "type": "uint160"},
-            {"name": "tick",                       "type": "int24"},
-            {"name": "observationIndex",           "type": "uint16"},
-            {"name": "observationCardinality",     "type": "uint16"},
+            {"name": "sqrtPriceX96", "type": "uint160"},
+            {"name": "tick", "type": "int24"},
+            {"name": "observationIndex", "type": "uint16"},
+            {"name": "observationCardinality", "type": "uint16"},
             {"name": "observationCardinalityNext", "type": "uint16"},
-            {"name": "feeProtocol",                "type": "uint8"},
-            {"name": "unlocked",                   "type": "bool"},
+            {"name": "feeProtocol", "type": "uint8"},
+            {"name": "unlocked", "type": "bool"},
         ],
         "stateMutability": "view", "type": "function",
     },
@@ -99,7 +99,6 @@ class ChainClient:
         self.swap_router = swap_router
         self.decimals = decimals
         self.symbol = "ERROR"
-
         self.w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 30}))
         self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.token = self.w3.eth.contract(address=self.contract_address, abi=ERC20_ABI)
@@ -169,9 +168,7 @@ class ChainClient:
 
     async def fetch_transfers(self, from_block: int, to_block: int) -> list[TokenTransfer]:
         def _logs():
-            return self.token.events.Transfer().get_logs(
-                from_block=from_block, to_block=to_block
-            )
+            return self.token.events.Transfer().get_logs(from_block=from_block, to_block=to_block)
         raw = await asyncio.to_thread(run_sync_retry, _logs, what="Transfer logs")
         if not raw:
             return []
@@ -196,9 +193,7 @@ class ChainClient:
 
     async def get_nonce(self, address: str) -> int:
         def _n():
-            return self.w3.eth.get_transaction_count(
-                Web3.to_checksum_address(address), "pending"
-            )
+            return self.w3.eth.get_transaction_count(Web3.to_checksum_address(address), "pending")
         return await asyncio.to_thread(run_sync_retry, _n, what="nonce") or 0
 
     async def buy_error(self, wallet_address: str, private_key: str,
@@ -265,8 +260,7 @@ class ChainClient:
                     approve_tx = self.token.functions.approve(
                         self.router.address, amount_in * 10
                     ).build_transaction({
-                        "from": addr, "gasPrice": gas_price,
-                        "nonce": nonce, "chainId": self.chain_id,
+                        "from": addr, "gasPrice": gas_price, "nonce": nonce, "chainId": self.chain_id,
                     })
                     approve_tx["gas"] = int(self.w3.eth.estimate_gas(approve_tx) * 1.2)
                     signed_a = self.w3.eth.account.sign_transaction(approve_tx, private_key)
@@ -280,8 +274,7 @@ class ChainClient:
                     "amountIn": amount_in, "amountOutMinimum": amount_out_min,
                     "sqrtPriceLimitX96": 0,
                 }).build_transaction({
-                    "from": addr, "gasPrice": gas_price,
-                    "nonce": current_nonce, "chainId": self.chain_id,
+                    "from": addr, "gasPrice": gas_price, "nonce": current_nonce, "chainId": self.chain_id,
                 })
                 swap_tx["gas"] = int(self.w3.eth.estimate_gas(swap_tx) * 1.2)
                 signed = self.w3.eth.account.sign_transaction(swap_tx, private_key)
@@ -294,4 +287,31 @@ class ChainClient:
             return TradeResult(False, None, "Transaction reverted")
         except Exception as exc:
             log.error("Sell failed: %s", exc)
+            return TradeResult(False, None, str(exc))
+
+    async def send_token(self, wallet_address: str, private_key: str,
+                         to_address: str, token_amount: float,
+                         gas_strategy: str = "medium") -> TradeResult:
+        try:
+            addr = Web3.to_checksum_address(wallet_address)
+            to_addr = Web3.to_checksum_address(to_address)
+            amount = int(token_amount * (10 ** self.decimals))
+            gas_price = await self.get_gas_price(gas_strategy)
+            nonce = await self.get_nonce(addr)
+
+            def _send():
+                tx = self.token.functions.transfer(to_addr, amount).build_transaction({
+                    "from": addr, "gasPrice": gas_price, "nonce": nonce, "chainId": self.chain_id,
+                })
+                tx["gas"] = int(self.w3.eth.estimate_gas(tx) * 1.2)
+                signed = self.w3.eth.account.sign_transaction(tx, private_key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed.raw_transaction)
+                return self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+            receipt = await asyncio.to_thread(run_sync_retry, _send, what="token transfer")
+            if receipt and receipt.status == 1:
+                return TradeResult(True, receipt.transactionHash.hex(), None, token_amount)
+            return TradeResult(False, None, "Transaction reverted")
+        except Exception as exc:
+            log.error("Transfer failed: %s", exc)
             return TradeResult(False, None, str(exc))
