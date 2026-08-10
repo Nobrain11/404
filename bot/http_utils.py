@@ -21,7 +21,7 @@ async def retry_async(func: Callable[[], Awaitable[T]], *, what: str, attempts: 
         except Exception as exc:
             last = exc
             delay = BACKOFF[min(i, len(BACKOFF) - 1)]
-            log.warning("%s failed (%s/%s): %s — retry in %ss", what, i+1, attempts, exc, delay)
+            log.warning("%s failed (%s/%s): %s — retry in %ss", what, i + 1, attempts, exc, delay)
             await asyncio.sleep(delay)
     log.error("%s permanently failed: %s", what, last)
     return None
@@ -35,7 +35,7 @@ def run_sync_retry(func: Callable[[], T], *, what: str, attempts: int = 6) -> T 
         except Exception as exc:
             last = exc
             delay = BACKOFF[min(i, len(BACKOFF) - 1)]
-            log.warning("%s failed (%s/%s): %s — retry in %ss", what, i+1, attempts, exc, delay)
+            log.warning("%s failed (%s/%s): %s — retry in %ss", what, i + 1, attempts, exc, delay)
             time.sleep(delay)
     log.error("%s permanently failed: %s", what, last)
     return None
