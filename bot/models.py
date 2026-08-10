@@ -18,6 +18,27 @@ class Base(DeclarativeBase):
     pass
 
 
+class GroupSettings(Base):
+    __tablename__ = "group_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    welcome_text: Mapped[str] = mapped_column(String(1024), default="🚀 Welcome {mention}!")
+    welcome_photo_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    welcome_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    moderation_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class BlacklistWord(Base):
+    __tablename__ = "blacklist_words"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    word: Mapped[str] = mapped_column(String(128), index=True)
+    added_by: Mapped[int] = mapped_column(BigInteger)
+
+
 class User(Base):
     __tablename__ = "users"
 

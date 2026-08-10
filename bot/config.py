@@ -63,6 +63,8 @@ class Settings:
     default_slippage: float
     whale_threshold: float
     referral_bonus_amount: float
+    raid_window_seconds: int
+    raid_join_count: int
 
     @property
     def branding(self) -> str:
@@ -119,6 +121,8 @@ def load_settings() -> Settings:
         default_slippage=float(_env("DEFAULT_SLIPPAGE", "1.0")),
         whale_threshold=float(_env("WHALE_THRESHOLD", "1.0")),
         referral_bonus_amount=float(_env("REFERRAL_BONUS_AMOUNT", "100.0")),
+        raid_window_seconds=int(_env("RAID_WINDOW_SECONDS", "60")),
+        raid_join_count=int(_env("RAID_JOIN_COUNT", "10")),
     )
 
 

@@ -6,6 +6,7 @@ from collections import defaultdict
 from typing import Optional, Tuple
 
 from sqlalchemy import select
+from telegram import ChatPermissions
 
 from .models import BlacklistWord, GroupSettings, get_session
 
@@ -119,7 +120,7 @@ async def apply_action(context, cfg, chat_id: int, user_id: int, username: str, 
             await context.bot.restrict_chat_member(
                 chat_id,
                 user_id,
-                permissions=chat_permissions.ChatPermissions(can_send_messages=False),
+                permissions=ChatPermissions(can_send_messages=False),
                 until_date=dt.datetime.utcnow() + dt.timedelta(hours=1),
             )
         elif severity == "kick":
