@@ -1,4 +1,4 @@
-"""Configuration – all settings loaded from environment variables."""
+"""All configuration loaded from environment variables."""
 from __future__ import annotations
 
 import logging
@@ -34,8 +34,12 @@ def _env(name: str, default: str | None = None, required: bool = False) -> str:
 
 @dataclass(frozen=True)
 class Settings:
+    # Telegram
     bot_token: str
     group_chat_id: int
+    admin_ids: list[int]          # admins who receive notifications
+
+    # Chain
     rpc_url: str
     chain_id: int
     explorer_url: str
@@ -44,18 +48,32 @@ class Settings:
     swap_router: str
     token_symbol: str
     token_decimals: int
+
+    # Infra
     database_url: str
     encryption_key: str
     port: int
+
+    # Branding
     project_website: str
     project_twitter: str
     project_group: str
+
+    # Trading
     default_slippage: float
     whale_threshold: float
     referral_bonus_amount: float
 
     @property
     def branding(self) -> str:
+        return (
+            f"🌐 [error404.world]({self.project_website})  "
+            f"🐦 [{self.project_twitter}](https://x.com/erro404hood)  "
+            f"💬 [{self.project_group}](https://t.me/error404groupofficial)"
+        )
+
+    @property
+    def branding_plain(self) -> str:
         return f"🌐 {self.project_website} | 🐦 {self.project_twitter} | 💬 {self.project_group}"
 
     def tx_link(self, tx_hash: str) -> str:
@@ -73,9 +91,17 @@ def load_settings() -> Settings:
         logging.critical("GROUP_CHAT_ID must be an integer")
         sys.exit(1)
 
+    raw_admins = _env("ADMIN_IDS", "")
+    admin_ids: list[int] = []
+    for a in raw_admins.split(","):
+        a = a.strip()
+        if a.isdigit():
+            admin_ids.append(int(a))
+
     return Settings(
         bot_token=_env("BOT_TOKEN", required=True),
         group_chat_id=group_chat_id,
+        admin_ids=admin_ids,
         rpc_url=_env("RPC_URL", "https://rpc.mainnet.chain.robinhood.com"),
         chain_id=int(_env("CHAIN_ID", "4663")),
         explorer_url=_env("EXPLORER_URL", "https://robinhoodchain.blockscout.com"),
@@ -97,6 +123,8 @@ def load_settings() -> Settings:
 
 
 DISCLAIMER = (
-    "⚠️ _Trading carries risk. Error404 is a memecoin with high volatility. "
-    "Trade responsibly. This bot is for entertainment purposes only._"
+    "⚠️ _Trading carries risk. $ERROR is a memecoin with high volatility. "
+    "Trade responsibly. This bot is for entertainment only._"
 )
+
+DIVIDER = "━━━━━━━━━━━━━━━━━━━━━━━━━━"
