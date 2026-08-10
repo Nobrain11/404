@@ -26,9 +26,7 @@ class MarketStats:
 async def fetch_market_stats(contract_address: str, explorer_url: str, chain_client=None) -> MarketStats:
     stats = MarketStats()
 
-    dex_data = await http_get_json(
-        f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
-    )
+    dex_data = await http_get_json(f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}")
     if dex_data:
         pairs = dex_data.get("pairs") or []
         if pairs:
@@ -44,9 +42,7 @@ async def fetch_market_stats(contract_address: str, explorer_url: str, chain_cli
             except Exception as exc:
                 log.warning("DexScreener parse error: %s", exc)
 
-    token_data = await http_get_json(
-        f"{explorer_url.rstrip('/')}/api/v2/tokens/{contract_address}"
-    )
+    token_data = await http_get_json(f"{explorer_url.rstrip('/')}/api/v2/tokens/{contract_address}")
     if token_data:
         try:
             stats.holders      = int(token_data.get("holders_count", 0) or 0)
@@ -70,6 +66,9 @@ async def fetch_top_holders(contract_address: str, explorer_url: str, limit: int
     if not data:
         return []
     return [
-        {"address": item.get("address", {}).get("hash", ""), "balance": float(item.get("value", 0) or 0) / 1e18}
+        {
+            "address": item.get("address", {}).get("hash", ""),
+            "balance": float(item.get("value", 0) or 0) / 1e18,
+        }
         for item in (data.get("items") or [])[:limit]
     ]
