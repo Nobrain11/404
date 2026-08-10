@@ -1,119 +1,135 @@
-"""All Telegram command + callback + text handlers."""
+"""All command + callback handlers."""
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import re
-from collections import defaultdict, deque
+from collections import defaultdict
 
-from sqlalchemy import func, select
-from telegram import Update
+from eth_account import Account
+from sqlalchemy import select, func
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
-from .admin import (
-    notify_new_user, notify_referral, notify_trade,
-    notify_wallet_created, notify_wallet_imported,
-)
-from .config import DISCLAIMER, DIVIDER, Settings
-from .crypto_utils import (
-    create_wallet, decrypt_secret, encrypt_secret,
-    import_from_mnemonic, import_from_private_key,
-    make_referral_code, short_addr,
-)
+from . import moderation
+from .config import DISCLAIMER, Settings
+from .crypto_utils import create_wallet, decrypt_secret, encrypt_secret, make_referral_code, short_addr
 from .keyboards import (
     kb_back_main, kb_buy_amounts, kb_confirm_cancel,
-    kb_import_choice, kb_main, kb_orders, kb_refer,
-    kb_replace_confirm, kb_sell_pct, kb_settings,
-    kb_wallet_home, kb_wallet_view, kb_welcome,
+    kb_import_choice, kb_main, kb_orders, kb_replace_confirm,
+    kb_sell_pct, kb_settings, kb_wallet_home, kb_wallet_view, kb_welcome,
 )
 from .models import (
-    DCAJob, LimitOrder, PriceAlert, Referral,
-    Transaction, User, get_session,
+    BlacklistWord, DCAJob, GroupSettings, LimitOrder,
+    PriceAlert, Referral, Transaction, User, get_session,
 )
 from .price import fetch_market_stats, fetch_top_holders
 
 log = logging.getLogger(__name__)
 
-URL_RE = re.compile(r"https?://\S+|t\.me/\S+|www\.\S+", re.IGNORECASE)
-ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
-MAX_URLS = 3
-REPEAT_LIMIT = 3
-
-_recent: dict[int, deque] = defaultdict(lambda: deque(maxlen=6))
-_strikes: dict[int, int] = defaultdict(int)
-
-# Per-user pending trade state
 _pending_buy: dict[int, float] = {}
 _pending_sell: dict[int, float] = {}
 _pending_limit_type: dict[int, str] = {}
 _pending_limit_amount: dict[int, float] = {}
-_pending_transfer_to: dict[int, str] = {}
+_last_welcomed: dict[tuple[int, int], float] = {}
+WELCOME_COOLDOWN_SECONDS = 60
 
 
-def _cfg(ctx: ContextTypes.DEFAULT_TYPE) -> Settings:
-    return ctx.application.bot_data["settings"]
+def _mdv2_escape(text: str) -> str:
+    """Escape literal text for Telegram MarkdownV2 (not for use inside code spans)."""
+    return re.sub(r"([_*\[\]()~`>#+\-=|{}.!\\])", r"\\\1", str(text))
 
 
-def _chain(ctx: ContextTypes.DEFAULT_TYPE):
-    return ctx.application.bot_data.get("chain")
+def _cfg(context: ContextTypes.DEFAULT_TYPE) -> Settings:
+    return context.application.bot_data["settings"]
 
 
-def _get_user(session, tid: int) -> User | None:
-    return session.scalar(select(User).where(User.telegram_id == tid))
+def _chain(context: ContextTypes.DEFAULT_TYPE):
+    return context.application.bot_data.get("chain")
 
 
-# ── Welcome screen ────────────────────────────────────────────────────────────
+def _get_user(session, telegram_id: int) -> User | None:
+    return session.scalar(select(User).where(User.telegram_id == telegram_id))
 
-async def _build_welcome(cfg: Settings, chain=None) -> str:
+
+def _is_admin(uid: int, cfg: Settings) -> bool:
+    return uid in cfg.admin_ids
+
+
+def _get_group_settings(session, chat_id: int) -> GroupSettings:
+    row = session.scalar(select(GroupSettings).where(GroupSettings.chat_id == chat_id))
+    if row is None:
+        row = GroupSettings(chat_id=chat_id)
+        session.add(row)
+        session.commit()
+    return row
+
+
+async def _welcome_text(cfg: Settings, chain=None) -> str:
     stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
     icon = "🟢" if stats.change_24h >= 0 else "🔴"
+    sign = "+" if stats.change_24h >= 0 else ""
     return (
-        f"{DIVIDER}\n"
-        f"  *ERROR 404 ({cfg.token_symbol})*\n"
-        f"{DIVIDER}\n\n"
-        f"💰  Price        *${stats.price_usd:.8f}*\n"
-        f"📈  24h Change  {icon} *{stats.change_24h:+.2f}%*\n"
-        f"📊  Market Cap  *${stats.market_cap:,.2f}*\n"
-        f"💧  Liquidity   *${stats.liquidity:,.2f}*\n"
-        f"🔊  24h Volume  *${stats.volume_24h:,.2f}*\n"
-        f"🟢  Buys        *{stats.buys_24h}*   "
-        f"🔴 Sells *{stats.sells_24h}*\n"
-        f"👥  Holders     *{stats.holders:,}*\n\n"
-        f"📌  Contract:\n`{cfg.contract_address}`\n\n"
-        f"{cfg.branding}"
+        f"💰 *${stats.price_usd:.8f}*  {icon} *{sign}{stats.change_24h:.2f}%*\n\n"
+        f"📊 Market Cap   `${stats.market_cap:,.2f}`\n"
+        f"💧 Liquidity    `${stats.liquidity:,.2f}`\n"
+        f"🔊 24h Volume   `${stats.volume_24h:,.2f}`\n"
+        f"👥 Holders      `{stats.holders}`\n\n"
+        f"🟢 Buys `{stats.buys_24h}`   🔴 Sells `{stats.sells_24h}`\n\n"
+        f"`{cfg.contract_address}`"
     )
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+def _wallet_dm_keyboard(cfg: Settings) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌐 Website", url=cfg.project_website),
+            InlineKeyboardButton("🐦 Twitter", url="https://twitter.com/erro404hood"),
+            InlineKeyboardButton("💬 Chat", url="https://t.me/error404groupofficial"),
+        ],
+    ])
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
+
+async def _send_wallet_dm(context, chat_id: int, cfg: Settings, address: str, private_key: str, title: str) -> None:
+    try:
+        await context.bot.send_message(
+            chat_id,
+            f"🔐 *{_mdv2_escape(title)}*\n\n"
+            f"*Wallet:* `{address}`\n"
+            "*Network:* Robinhood Chain\n\n"
+            f"*Private Key:* ||{_mdv2_escape(private_key)}||\n"
+            "_Tap above to reveal — store it offline\\. "
+            "Losing it means losing funds\\._\n\n"
+            f"{_mdv2_escape(cfg.branding_plain)}\n\n"
+            f"{_mdv2_escape(DISCLAIMER)}",
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=_wallet_dm_keyboard(cfg),
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        log.warning("Wallet DM failed: %s", exc)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
     tg_user = update.effective_user
     if not tg_user:
         return
     username = tg_user.username or tg_user.first_name or "anon"
+    referral_code = None
+    if context.args and context.args[0].startswith("ref_"):
+        referral_code = context.args[0][4:]
 
-    referral_code: str | None = None
-    if ctx.args and ctx.args[0].startswith("ref_"):
-        referral_code = ctx.args[0][4:]
-
-    is_new = False
     with get_session() as session:
-        existing = _get_user(session, tg_user.id)
-        if not existing:
-            is_new = True
-            address, private_key, mnemonic = create_wallet()
-            encrypted_key = encrypt_secret(private_key, cfg.encryption_key)
-            encrypted_seed = encrypt_secret(mnemonic, cfg.encryption_key)
-
+        if not _get_user(session, tg_user.id):
+            address, private_key = create_wallet()
+            encrypted = encrypt_secret(private_key, cfg.encryption_key)
             user = User(
-                telegram_id=tg_user.id,
-                username=username,
-                wallet_address=address,
-                encrypted_private_key=encrypted_key,
+                telegram_id=tg_user.id, username=username,
+                wallet_address=address, encrypted_private_key=encrypted,
                 referral_code=make_referral_code(tg_user.id),
             )
-
             referrer = None
             if referral_code:
                 referrer = session.scalar(select(User).where(User.referral_code == referral_code))
@@ -124,178 +140,113 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         referee_id=tg_user.id,
                         reward_amount=cfg.referral_bonus_amount,
                     ))
-
             session.add(user)
             session.commit()
 
-            referrer_name = referrer.username if referrer else None
+            await _send_wallet_dm(context, tg_user.id, cfg, address, private_key, "ERROR404 TERMINAL")
 
-            # DM sensitive info
-            try:
-                await ctx.bot.send_message(
-                    tg_user.id,
-                    f"🔐 *Your Error404 Wallet is Ready!*\n"
-                    f"{DIVIDER}\n\n"
-                    f"👛 *Address:*\n`{address}`\n\n"
-                    f"🔑 *Encrypted Private Key:*\n`{encrypted_key}`\n\n"
-                    f"🌱 *Encrypted Seed Phrase:*\n`{encrypted_seed}`\n\n"
-                    f"⚠️ *IMPORTANT:* Back these up securely offline.\n"
-                    f"Never share your seed or private key with anyone.\n\n"
-                    f"{cfg.branding}\n\n{DISCLAIMER}",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception as exc:
-                log.warning("DM failed for %s: %s", tg_user.id, exc)
-
-            # Admin notifications
-            await notify_new_user(ctx.bot, cfg, username, tg_user.id, address, referrer_name)
-            await notify_wallet_created(ctx.bot, cfg, username, tg_user.id, address)
-
-            if referrer and referrer_name:
-                await notify_referral(ctx.bot, cfg, referrer_name, username)
+            if referrer:
                 try:
-                    await ctx.bot.send_message(
+                    await context.bot.send_message(
                         referrer.telegram_id,
-                        f"🎉 *Referral Successful!*\n\n"
-                        f"*@{username}* joined using your referral link!\n"
-                        f"💰 Bonus: *{cfg.referral_bonus_amount} {cfg.token_symbol}* "
-                        f"will be credited to your wallet.\n\n"
-                        f"{cfg.branding}",
+                        f"🎉 *@{username}* joined via your referral!\n"
+                        f"Bonus: *{cfg.referral_bonus_amount} {cfg.token_symbol}*\n\n{cfg.branding}",
                         parse_mode=ParseMode.MARKDOWN,
                     )
                 except Exception:
                     pass
 
-            # Group announcement
             try:
-                await ctx.bot.send_message(
+                await context.bot.send_message(
                     cfg.group_chat_id,
-                    f"🚀 *@{username}* just joined Error404!\n"
-                    f"Wallet: `{address}`\n{cfg.branding}",
+                    f"🚀 Welcome @{username}! Wallet: `{address}` – let's trade {cfg.token_symbol}!\n{cfg.branding}",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
                 pass
 
-    text = await _build_welcome(cfg, _chain(ctx))
+    text = await _welcome_text(cfg, _chain(context))
     await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_welcome(),
-        disable_web_page_preview=True,
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_welcome()
     )
 
 
-# ── /wallet ───────────────────────────────────────────────────────────────────
-
-async def wallet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await _show_wallet(update.effective_message, ctx, update.effective_user.id)
-
-
-async def _show_wallet(message, ctx, uid: int) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
+    uid = update.effective_user.id
     with get_session() as session:
         user = _get_user(session, uid)
-
     if not user:
-        # No wallet yet — show creation/import menu
-        await message.reply_text(
-            f"👛 *Wallet*\n{DIVIDER}\n\n"
-            f"You don't have a wallet yet.\n\n"
-            f"Choose an option below to get started:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_wallet_home(),
-        )
+        await update.effective_message.reply_text("No wallet — send /start first.")
         return
-
     eth_bal = await chain.native_balance(user.wallet_address) if chain else 0.0
     tok_bal = await chain.token_balance(user.wallet_address) if chain else 0.0
-    stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
-    tok_usd = tok_bal * stats.price_usd
-    eth_usd = eth_bal * 3000  # approximate
-
     with get_session() as session:
         recent = session.scalars(
-            select(Transaction)
-            .where(Transaction.wallet_address == user.wallet_address)
+            select(Transaction).where(Transaction.wallet_address == user.wallet_address)
             .order_by(Transaction.timestamp.desc()).limit(5)
         ).all()
-
     tx_lines = "\n".join(
-        f"  {'🟢' if t.tx_type in ('buy','receive') else '🔴'} "
-        f"`{t.tx_type.upper()}` {t.amount:.4f} {t.token_symbol} "
-        f"— [tx]({cfg.tx_link(t.tx_hash)})"
+        f"• {t.tx_type.upper()} {t.amount:.4f} {t.token_symbol} — [tx]({cfg.tx_link(t.tx_hash)})"
         for t in recent
-    ) or "  _No transactions yet_"
-
-    await message.reply_text(
-        f"👛 *Your Wallet*\n{DIVIDER}\n\n"
-        f"📌 Address:\n`{user.wallet_address}`\n\n"
-        f"💎  ETH:      `{eth_bal:.6f}` (~${eth_usd:,.2f})\n"
-        f"🪙  {cfg.token_symbol}:  `{tok_bal:,.4f}` (~${tok_usd:,.4f})\n\n"
-        f"📋 *Recent Transactions:*\n{tx_lines}\n\n"
-        f"[🔍 View on Explorer]({cfg.address_link(user.wallet_address)})",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-        reply_markup=kb_wallet_view(has_wallet=True),
+    ) or "_No transactions yet_"
+    text = (
+        f"👛 *Your Wallet*\n`{user.wallet_address}`\n\n"
+        f"💎 ETH: `{eth_bal:.6f}`\n🪙 {cfg.token_symbol}: `{tok_bal:,.4f}`\n\n"
+        f"*Recent Txs:*\n{tx_lines}\n\n"
+        f"[Explorer]({cfg.address_link(user.wallet_address)})\n\n{cfg.branding}"
     )
-
-
-# ── /contract ─────────────────────────────────────────────────────────────────
-
-async def contract_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
+    kb = kb_wallet_view(has_wallet=True) if _is_admin(uid, cfg) else kb_back_main()
     await update.effective_message.reply_text(
-        f"📜 *Error404 Contract Info*\n{DIVIDER}\n\n"
-        f"🪙  Token: *Error404 ({cfg.token_symbol})*\n"
-        f"📐  Standard: ERC-404 (hybrid ERC-20 / ERC-721)\n"
-        f"⛓  Chain: Robinhood Chain (ID: {cfg.chain_id})\n\n"
-        f"📌  Contract:\n`{cfg.contract_address}`\n\n"
-        f"[🔍 View on Explorer]({cfg.address_link(cfg.contract_address)})\n\n"
-        f"{cfg.branding}\n\n{DISCLAIMER}",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-        reply_markup=kb_back_main(),
+        text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=kb,
     )
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
-
-async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
+async def contract_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
     await update.effective_message.reply_text(
-        f"❓ *Error404 Bot — Help*\n{DIVIDER}\n\n"
-        f"*Commands:*\n"
-        f"  /start — Live stats + main menu\n"
-        f"  /wallet — Wallet management\n"
-        f"  /contract — Token contract info\n"
-        f"  /alert above 0.001 — Price alert\n"
-        f"  /alert below 0.0005 — Price alert\n"
-        f"  /help — This menu\n\n"
-        f"*Trading (via menu):*\n"
-        f"  🟢 Buy · 🔴 Sell · 📈 DCA\n"
-        f"  Limit Orders · Transfer · Portfolio\n\n"
-        f"*Wallet (via menu):*\n"
-        f"  Create · Import (key/seed) · Export\n\n"
-        f"{cfg.branding}\n\n{DISCLAIMER}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_back_main(),
+        f"📜 *Error404 ({cfg.token_symbol})* — ERC-404 on Robinhood Chain\n"
+        f"`{cfg.contract_address}`\n"
+        f"[Explorer]({cfg.address_link(cfg.contract_address)})\n\n{cfg.branding}\n\n{DISCLAIMER}",
+        parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
     )
 
 
-# ── /alert ────────────────────────────────────────────────────────────────────
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    admin_lines = ""
+    if _is_admin(uid, cfg):
+        admin_lines = (
+            "\n*Admin*\n"
+            "/setwelcome <text> — set welcome message ({mention} = user)\n"
+            "/setwelcomeimage — reply to a photo to set banner\n"
+            "/addword <word> — blacklist a word/phrase\n"
+            "/removeword <word> — remove from blacklist\n"
+            "/listwords — show blacklist\n"
+        )
+    await update.effective_message.reply_text(
+        "🤖 *Error404 Bot*\n\n"
+        "/start — Live stats + wallet\n/wallet — Balances & txs\n"
+        "/contract — Token info\n/alert above|below PRICE — Price alert\n/help — This menu"
+        f"{admin_lines}\n\n{cfg.branding}\n\n{DISCLAIMER}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-async def alert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    args = ctx.args
+
+async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
     if len(args) != 2 or args[0] not in ("above", "below"):
         await update.effective_message.reply_text(
-            "Usage:\n`/alert above 0.001`\n`/alert below 0.0005`",
+            "Usage: `/alert above 0.001` or `/alert below 0.0005`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
     try:
         price = float(args[1])
     except ValueError:
-        await update.effective_message.reply_text("❌ Invalid price.")
+        await update.effective_message.reply_text("Invalid price.")
         return
     uid = update.effective_user.id
     with get_session() as session:
@@ -305,99 +256,247 @@ async def alert_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         session.add(PriceAlert(user_id=uid, target_price=price, direction=args[0]))
         session.commit()
     await update.effective_message.reply_text(
-        f"🔔 *Alert Set*\n\nYou'll be notified when {_cfg(ctx).token_symbol} goes "
-        f"*{args[0]}* `${price:.8f}`",
+        f"🔔 Alert set: notify when price goes *{args[0]}* `${price}`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-# ── Callback router ───────────────────────────────────────────────────────────
+# ── Admin: welcome + blacklist config ────────────────────────────────────────
 
-async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def setwelcome_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    if not _is_admin(uid, cfg):
+        await update.effective_message.reply_text("🔒 Admin only.")
+        return
+    text = update.effective_message.text.partition(" ")[2].strip()
+    if not text:
+        await update.effective_message.reply_text(
+            "Usage: `/setwelcome 👾 Welcome, {mention}.\\n\\nProfit Not Found. Community Found.`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    with get_session() as session:
+        gs = _get_group_settings(session, cfg.group_chat_id)
+        gs.welcome_text = text[:1024]
+        gs.updated_at = dt.datetime.utcnow()
+        session.commit()
+    await update.effective_message.reply_text("✅ Welcome message updated.")
+
+
+async def setwelcomeimage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    if not _is_admin(uid, cfg):
+        await update.effective_message.reply_text("🔒 Admin only.")
+        return
+    msg = update.effective_message
+    photo_source = msg.photo or (msg.reply_to_message.photo if msg.reply_to_message else None)
+    if not photo_source:
+        await msg.reply_text("Send this command as the caption of a photo, or reply to one with /setwelcomeimage.")
+        return
+    file_id = photo_source[-1].file_id
+    with get_session() as session:
+        gs = _get_group_settings(session, cfg.group_chat_id)
+        gs.welcome_photo_file_id = file_id
+        gs.updated_at = dt.datetime.utcnow()
+        session.commit()
+    await msg.reply_text("✅ Welcome banner image updated.")
+
+
+async def addword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    if not _is_admin(uid, cfg):
+        await update.effective_message.reply_text("🔒 Admin only.")
+        return
+    word = update.effective_message.text.partition(" ")[2].strip().lower()
+    if not word:
+        await update.effective_message.reply_text("Usage: `/addword scamword`", parse_mode=ParseMode.MARKDOWN)
+        return
+    with get_session() as session:
+        exists = session.scalar(
+            select(BlacklistWord).where(BlacklistWord.chat_id == cfg.group_chat_id, BlacklistWord.word == word)
+        )
+        if not exists:
+            session.add(BlacklistWord(chat_id=cfg.group_chat_id, word=word, added_by=uid))
+            session.commit()
+    await update.effective_message.reply_text(f"✅ Added to blacklist: `{word}`", parse_mode=ParseMode.MARKDOWN)
+
+
+async def removeword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    if not _is_admin(uid, cfg):
+        await update.effective_message.reply_text("🔒 Admin only.")
+        return
+    word = update.effective_message.text.partition(" ")[2].strip().lower()
+    with get_session() as session:
+        row = session.scalar(
+            select(BlacklistWord).where(BlacklistWord.chat_id == cfg.group_chat_id, BlacklistWord.word == word)
+        )
+        if row:
+            session.delete(row)
+            session.commit()
+    await update.effective_message.reply_text(f"✅ Removed from blacklist: `{word}`", parse_mode=ParseMode.MARKDOWN)
+
+
+async def listwords_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    uid = update.effective_user.id
+    if not _is_admin(uid, cfg):
+        await update.effective_message.reply_text("🔒 Admin only.")
+        return
+    with get_session() as session:
+        words = session.scalars(
+            select(BlacklistWord.word).where(BlacklistWord.chat_id == cfg.group_chat_id)
+        ).all()
+    text = "\n".join(f"• `{w}`" for w in words) or "_No blacklisted words yet._"
+    await update.effective_message.reply_text(f"🚫 *Blacklist*\n\n{text}", parse_mode=ParseMode.MARKDOWN)
+
+
+# ── Welcome banner ────────────────────────────────────────────────────────────
+
+async def welcome_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    msg = update.message
+    members = [m for m in (msg.new_chat_members or []) if not m.is_bot]
+
+    # Always delete Telegram's default join service message
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    if not members:
+        return
+
+    with get_session() as session:
+        gs = _get_group_settings(session, cfg.group_chat_id)
+        welcome_text, photo_id, enabled = gs.welcome_text, gs.welcome_photo_file_id, gs.welcome_enabled
+
+    if not enabled:
+        return
+
+    now = dt.datetime.utcnow().timestamp()
+    fresh_members = []
+    for m in members:
+        key = (cfg.group_chat_id, m.id)
+        last = _last_welcomed.get(key, 0)
+        if now - last < WELCOME_COOLDOWN_SECONDS:
+            continue  # avoid duplicate welcome for the same user (e.g. duplicate TG updates)
+        _last_welcomed[key] = now
+        fresh_members.append(m)
+
+    if not fresh_members:
+        return
+
+    mentions = ", ".join(f"@{m.username}" if m.username else m.first_name for m in fresh_members)
+    text = welcome_text.replace("{mention}", mentions)
+
+    try:
+        if photo_id:
+            await context.bot.send_photo(
+                cfg.group_chat_id, photo=photo_id, caption=text, parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await context.bot.send_message(
+                cfg.group_chat_id, text, parse_mode=ParseMode.MARKDOWN,
+            )
+    except Exception as exc:
+        log.warning("Welcome send failed: %s", exc)
+
+    # Raid detection — many joins in a short window
+    is_raid = False
+    for _ in fresh_members:
+        is_raid = moderation.record_join_and_check_raid(cfg) or is_raid
+    if is_raid:
+        for admin_id in cfg.admin_ids:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"🚨 Possible raid detected in the group — {cfg.raid_join_count}+ joins within "
+                    f"{cfg.raid_window_seconds}s. Consider enabling slow mode or approval-based joins.",
+                )
+            except Exception:
+                pass
+
+
+# ── Callback / trading / settings (unchanged from prior version) ────────────
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+    cfg = _cfg(context)
+    chain = _chain(context)
     uid = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name or "anon"
 
-    # ── Menu ──────────────────────────────────────────────────────────────────
+    async def _deny():
+        await query.answer("🔒 Admin only.", show_alert=True)
+
     if data == "menu:main":
-        text = await _build_welcome(cfg, chain)
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN,
-                                       reply_markup=kb_main(), disable_web_page_preview=True)
+        text = await _welcome_text(cfg, chain)
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb_main())
 
     elif data == "menu:wallet":
         with get_session() as session:
             user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text(
-                f"👛 *Wallet*\n{DIVIDER}\n\n"
-                f"You don't have a wallet yet.\nChoose an option below:",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_wallet_home(),
-            )
+            await query.edit_message_text("No wallet — send /start first.")
             return
         eth_bal = await chain.native_balance(user.wallet_address) if chain else 0.0
         tok_bal = await chain.token_balance(user.wallet_address) if chain else 0.0
-        stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
-        tok_usd = tok_bal * stats.price_usd
-        eth_usd = eth_bal * 3000
         with get_session() as session:
             recent = session.scalars(
                 select(Transaction).where(Transaction.wallet_address == user.wallet_address)
                 .order_by(Transaction.timestamp.desc()).limit(5)
             ).all()
         tx_lines = "\n".join(
-            f"  {'🟢' if t.tx_type in ('buy', 'receive') else '🔴'} "
-            f"`{t.tx_type.upper()}` {t.amount:.4f} {t.token_symbol} "
-            f"— [tx]({cfg.tx_link(t.tx_hash)})"
+            f"• {t.tx_type.upper()} {t.amount:.4f} {t.token_symbol} — [tx]({cfg.tx_link(t.tx_hash)})"
             for t in recent
-        ) or "  _No transactions yet_"
+        ) or "_No transactions yet_"
+        kb = kb_wallet_view(has_wallet=True) if _is_admin(uid, cfg) else kb_back_main()
         await query.edit_message_text(
-            f"👛 *Your Wallet*\n{DIVIDER}\n\n"
-            f"📌 Address:\n`{user.wallet_address}`\n\n"
-            f"💎  ETH:     `{eth_bal:.6f}` (~${eth_usd:,.2f})\n"
-            f"🪙  {cfg.token_symbol}: `{tok_bal:,.4f}` (~${tok_usd:,.4f})\n\n"
-            f"📋 *Recent Transactions:*\n{tx_lines}\n\n"
-            f"[🔍 Explorer]({cfg.address_link(user.wallet_address)})",
+            f"👛 *Your Wallet*\n`{user.wallet_address}`\n\n"
+            f"💎 ETH: `{eth_bal:.6f}`\n🪙 {cfg.token_symbol}: `{tok_bal:,.4f}`\n\n"
+            f"*Recent Txs:*\n{tx_lines}\n\n[Explorer]({cfg.address_link(user.wallet_address)})\n\n{cfg.branding}",
             parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-            reply_markup=kb_wallet_view(has_wallet=True),
+            reply_markup=kb,
         )
 
     elif data == "menu:portfolio":
         with get_session() as session:
             user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
+            await query.edit_message_text("No wallet — send /start first.")
             return
         stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
         eth_bal = await chain.native_balance(user.wallet_address) if chain else 0.0
         tok_bal = await chain.token_balance(user.wallet_address) if chain else 0.0
         tok_usd = tok_bal * stats.price_usd
         eth_usd = eth_bal * 3000
-        total = tok_usd + eth_usd
-        icon = "🟢" if stats.change_24h >= 0 else "🔴"
         await query.edit_message_text(
-            f"📊 *Portfolio*\n{DIVIDER}\n\n"
-            f"💎  ETH:            `{eth_bal:.6f}` ≈ *${eth_usd:,.2f}*\n"
-            f"🪙  {cfg.token_symbol}:         `{tok_bal:,.4f}` ≈ *${tok_usd:,.4f}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💼  Total Value:    *${total:,.4f}*\n\n"
-            f"💰  {cfg.token_symbol} Price: `${stats.price_usd:.8f}`\n"
-            f"📈  24h Change:     {icon} *{stats.change_24h:+.2f}%*\n",
+            f"📊 *Portfolio*\n\n"
+            f"💎 ETH: `{eth_bal:.6f}` (~${eth_usd:,.2f})\n"
+            f"🪙 {cfg.token_symbol}: `{tok_bal:,.4f}` (~${tok_usd:,.4f})\n\n"
+            f"💼 *Total: ~${tok_usd + eth_usd:,.4f}*\n\n"
+            f"{cfg.token_symbol} price: ${stats.price_usd:.8f}\n\n{cfg.branding}",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
 
     elif data == "menu:top10":
-        holders = await fetch_top_holders(cfg.contract_address, cfg.explorer_url, 10)
-        medals = ["🥇", "🥈", "🥉"] + ["🔹"] * 7
-        lines = "\n".join(
-            f"  {medals[i]} `{short_addr(h['address'])}` — *{h['balance']:,.2f}* {cfg.token_symbol}"
-            for i, h in enumerate(holders)
-        ) or "  _Could not fetch holders_"
+        try:
+            holders = await fetch_top_holders(cfg.contract_address, cfg.explorer_url, 10)
+            lines = "\n".join(
+                f"{i+1}. `{short_addr(h['address'])}` — {h['balance']:,.2f} {cfg.token_symbol}"
+                for i, h in enumerate(holders)
+            ) or "_No holder data returned_"
+        except Exception as exc:
+            log.warning("fetch_top_holders failed: %s", exc)
+            lines = "_Could not fetch holders right now — try again shortly._"
         await query.edit_message_text(
-            f"🐋 *Top 10 Holders*\n{DIVIDER}\n\n{lines}\n\n{cfg.branding}",
+            f"🐋 *Top 10 Holders*\n\n{lines}\n\n{cfg.branding}",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
 
@@ -405,15 +504,13 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         with get_session() as session:
             user = _get_user(session, uid)
             if not user:
-                await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
+                await query.edit_message_text("No wallet — send /start first.")
                 return
             user.monitor_enabled = not user.monitor_enabled
             session.commit()
             state = "ON 🟢" if user.monitor_enabled else "OFF 🔴"
         await query.edit_message_text(
-            f"🔔 *Wallet Monitor: {state}*\n{DIVIDER}\n\n"
-            f"When enabled, every transaction on your wallet sends you a private DM alert.\n"
-            f"Whale transactions are also flagged automatically.\n\n{cfg.branding}",
+            f"🔔 *Wallet Monitor: {state}*\n\nEvery tx on your wallet will DM you.\n\n{cfg.branding}",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
 
@@ -421,7 +518,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         with get_session() as session:
             user = _get_user(session, uid)
             if not user:
-                await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
+                await query.edit_message_text("No wallet — send /start first.")
                 return
             total_refs = session.scalar(
                 select(func.count(Referral.id)).where(Referral.referrer_id == uid)
@@ -430,299 +527,196 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 select(func.sum(Referral.reward_amount)).where(Referral.referrer_id == uid)
             ) or 0.0
             code = user.referral_code
-
-        bot_username = ctx.bot.username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{code}"
-
+        ref_link = f"https://t.me/{context.bot.username}?start=ref_{code}"
         await query.edit_message_text(
-            f"🤝 *Referral Program*\n{DIVIDER}\n\n"
-            f"Earn *{cfg.referral_bonus_amount} {cfg.token_symbol}* for every friend you bring!\n\n"
-            f"🔗 *Your Referral Link:*\n`{ref_link}`\n\n"
-            f"📊 *Your Stats:*\n"
-            f"  👥  Total Referrals:  *{total_refs}*\n"
-            f"  💰  Total Bonus:      *{total_bonus:,.2f} {cfg.token_symbol}*\n\n"
-            f"📤 Share your link — your friends get a free wallet instantly!\n\n"
-            f"{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=kb_refer(ref_link),
+            f"🤝 *Referral Program*\n\n"
+            f"Your link: `{ref_link}`\n\n"
+            f"👥 Referrals: *{total_refs}*\n"
+            f"💰 Bonus earned: *{total_bonus:.2f} {cfg.token_symbol}*\n\n"
+            f"Earn *{cfg.referral_bonus_amount} {cfg.token_symbol}* per friend!\n\n{cfg.branding}",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
-
-    elif data == "refer:copy":
-        with get_session() as session:
-            user = _get_user(session, uid)
-            code = user.referral_code if user else "N/A"
-        ref_link = f"https://t.me/{ctx.bot.username}?start=ref_{code}"
-        await query.answer(f"Link: {ref_link}", show_alert=True)
 
     elif data == "menu:settings":
         with get_session() as session:
             user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
-            return
         await query.edit_message_text(
-            f"⚙️ *Settings*\n{DIVIDER}\n\nCustomise your trading experience:",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user),
+            "⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user)
         )
 
     elif data == "menu:help":
         await query.edit_message_text(
-            f"❓ *Error404 Bot — Help*\n{DIVIDER}\n\n"
-            f"/start — Live stats + main menu\n"
-            f"/wallet — Wallet management\n"
-            f"/contract — Token contract info\n"
-            f"/alert above|below PRICE\n"
-            f"/help — This menu\n\n"
+            "🤖 *Error404 Bot Help*\n\n"
+            "/start — Live stats\n/wallet — Balances\n/contract — Token info\n"
+            "/alert above|below PRICE\n\n"
             f"{cfg.branding}\n\n{DISCLAIMER}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_back_main(),
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
 
-    # ── Wallet flows ──────────────────────────────────────────────────────────
+    # ── Wallet management (admin only) ─────────────────────────────────────
+
     elif data == "wallet:create":
+        if not _is_admin(uid, cfg):
+            return await _deny()
+        await query.edit_message_text("🔑 *Import Private Key*\n\nSend it in your next message.",
+                                       parse_mode=ParseMode.MARKDOWN)
+        context.user_data["awaiting"] = "import_key"
+
+    elif data == "wallet:import_key":
+        if not _is_admin(uid, cfg):
+            return await _deny()
+        context.user_data["awaiting"] = "import_key"
+        await query.edit_message_text(
+            "🔑 *Import Wallet — Private Key*\n\n"
+            "Send the private key \\(starts with `0x`, 64 hex chars\\)\\.\n\n"
+            "⚠️ _This replaces the current wallet on file\\. Delete your message after import confirms\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+    elif data == "wallet:import_seed":
+        if not _is_admin(uid, cfg):
+            return await _deny()
+        context.user_data["awaiting"] = "import_seed"
+        await query.edit_message_text(
+            "🌱 *Import Wallet — Seed Phrase*\n\n"
+            "Send the 12/24\\-word seed phrase\\.\n\n"
+            "⚠️ _This replaces the current wallet on file\\. Delete your message after import confirms\\._",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+    elif data == "wallet:export_key":
+        if not _is_admin(uid, cfg):
+            return await _deny()
         with get_session() as session:
-            existing = _get_user(session, uid)
-        if existing:
-            await query.edit_message_text(
-                f"⚠️ *Wallet Already Exists*\n{DIVIDER}\n\n"
-                f"You already have a wallet:\n`{existing.wallet_address}`\n\n"
-                f"To replace it, use the Replace option (your current wallet access will be lost).",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_wallet_view(has_wallet=True),
-            )
+            user = _get_user(session, uid)
+        if not user:
+            await query.edit_message_text("No wallet on file.", reply_markup=kb_back_main())
             return
-        await _do_create_wallet(query, ctx, uid, username, cfg)
+        pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
+        await _send_wallet_dm(context, uid, cfg, user.wallet_address, pk, "WALLET EXPORT")
+        await query.edit_message_text("✅ Sent to your DMs.", reply_markup=kb_wallet_view(has_wallet=True))
+
+    elif data == "wallet:export_seed":
+        if not _is_admin(uid, cfg):
+            return await _deny()
+        await query.edit_message_text(
+            "ℹ️ This wallet was generated from a raw private key, no seed phrase is stored. "
+            "Use *Export Key* instead.",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_wallet_view(has_wallet=True),
+        )
 
     elif data == "wallet:replace":
+        if not _is_admin(uid, cfg):
+            return await _deny()
         await query.edit_message_text(
-            f"⚠️ *Replace Wallet?*\n{DIVIDER}\n\n"
-            f"This will *permanently replace* your current wallet in the bot.\n\n"
-            f"Make sure you have exported your private key or seed phrase first!\n\n"
-            f"Your old wallet still exists on-chain — you just won't be able to "
-            f"use it through this bot anymore.",
+            "⚠️ *Replace Wallet?*\n\nThis generates a brand-new wallet and overwrites the one on file. "
+            "The old address will no longer be tracked by the bot.",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_replace_confirm(),
         )
 
     elif data == "wallet:replace_confirm":
-        await _do_create_wallet(query, ctx, uid, username, cfg, replace=True)
+        if not _is_admin(uid, cfg):
+            return await _deny()
+        address, private_key = create_wallet()
+        encrypted = encrypt_secret(private_key, cfg.encryption_key)
+        with get_session() as session:
+            user = _get_user(session, uid)
+            if not user:
+                await query.edit_message_text("No account — send /start first.")
+                return
+            user.wallet_address = address
+            user.encrypted_private_key = encrypted
+            session.commit()
+        await _send_wallet_dm(context, uid, cfg, address, private_key, "WALLET REPLACED")
+        await query.edit_message_text("✅ New wallet generated — check your DMs.", reply_markup=kb_back_main())
 
-    elif data == "wallet:import_key":
-        ctx.user_data["awaiting"] = "import_key"
-        await query.edit_message_text(
-            f"🔑 *Import via Private Key*\n{DIVIDER}\n\n"
-            f"Send your *private key* in the next message.\n\n"
-            f"⚠️ This message will be deleted immediately after processing.\n"
-            f"Never share your key in public chats.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    elif data == "wallet:import_seed":
-        ctx.user_data["awaiting"] = "import_seed"
-        await query.edit_message_text(
-            f"🌱 *Import via Seed Phrase*\n{DIVIDER}\n\n"
-            f"Send your *12 or 24 word seed phrase* in the next message.\n\n"
-            f"⚠️ This message will be deleted immediately after processing.\n"
-            f"Never share your seed phrase in public chats.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    elif data == "wallet:export_key":
+    elif data.startswith("trade:buy"):
         with get_session() as session:
             user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet found.", reply_markup=kb_back_main())
-            return
-        try:
-            pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
-            await ctx.bot.send_message(
-                uid,
-                f"🔑 *Your Private Key*\n{DIVIDER}\n\n"
-                f"`{pk}`\n\n"
-                f"⚠️ *KEEP THIS SECRET.* Anyone with this key controls your wallet.\n"
-                f"Delete this message after saving it securely.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            await query.answer("✅ Private key sent to your DM", show_alert=True)
-        except Exception as exc:
-            log.error("Export key failed: %s", exc)
-            await query.answer("❌ Could not export key. Try again.", show_alert=True)
-
-    elif data == "wallet:export_seed":
-        with get_session() as session:
-            user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet found.", reply_markup=kb_back_main())
-            return
-        # Check if we have an encrypted seed stored (from create_wallet flow)
-        # We store seed as encrypted_private_key field with a prefix marker in some setups
-        # For simplicity we note that seed is only available if wallet was created here
-        await ctx.bot.send_message(
-            uid,
-            f"🌱 *Seed Phrase Export*\n{DIVIDER}\n\n"
-            f"Your seed phrase was sent to you when you first created your wallet.\n"
-            f"Check your DM history with this bot for the original backup message.\n\n"
-            f"If you imported your wallet, the seed phrase from the original "
-            f"wallet source is the one to use.\n\n"
-            f"⚠️ Never share your seed phrase with anyone.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await query.answer("ℹ️ Seed info sent to your DM", show_alert=True)
-
-    # ── Trading ───────────────────────────────────────────────────────────────
-    elif data == "trade:buy":
-        with get_session() as session:
-            user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
+            await query.edit_message_text("No wallet — send /start first.")
             return
         stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
-        icon = "🟢" if stats.change_24h >= 0 else "🔴"
         await query.edit_message_text(
-            f"🟢 *Buy {cfg.token_symbol}*\n{DIVIDER}\n\n"
-            f"💰  Price:      *${stats.price_usd:.8f}*\n"
-            f"📈  24h:        {icon} *{stats.change_24h:+.2f}%*\n"
-            f"📐  Slippage:   *{user.slippage}%*\n"
-            f"⛽  Gas:        *{user.gas_strategy.title()}*\n\n"
-            f"Select ETH amount to spend:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_buy_amounts(user.default_eth_amount),
+            f"🟢 *Buy {cfg.token_symbol}*\n\nPrice: *${stats.price_usd:.8f}*\nSlippage: *{user.slippage}%*\n\nSelect ETH amount:",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_buy_amounts(user.default_eth_amount),
         )
 
     elif data.startswith("buy_preset:"):
         eth_amt = float(data.split(":")[1])
         _pending_buy[uid] = eth_amt
-        await _show_buy_confirm(query, ctx, uid, eth_amt)
+        await _show_buy_confirm(query, context, uid, eth_amt)
 
     elif data == "buy_custom":
-        ctx.user_data["awaiting"] = "buy_amount"
-        await query.edit_message_text(
-            f"✏️ *Custom Buy Amount*\n{DIVIDER}\n\n"
-            f"Enter ETH amount to spend (e.g. `0.05`):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["awaiting"] = "buy_amount"
+        await query.edit_message_text("✏️ Enter ETH amount (e.g. `0.05`):", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "buy_confirm:confirm":
-        await _execute_buy(query, ctx, uid, username)
+        await _execute_buy(query, context, uid)
 
     elif data == "buy_confirm:cancel":
         _pending_buy.pop(uid, None)
-        await query.edit_message_text("✖ Buy cancelled.", reply_markup=kb_back_main())
+        await query.edit_message_text("❌ Buy cancelled.", reply_markup=kb_back_main())
 
     elif data == "trade:sell":
         with get_session() as session:
             user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
+            await query.edit_message_text("No wallet — send /start first.")
             return
         tok_bal = await chain.token_balance(user.wallet_address) if chain else 0.0
         if tok_bal <= 0:
-            await query.edit_message_text(
-                f"❌ You have no {cfg.token_symbol} to sell.", reply_markup=kb_back_main()
-            )
+            await query.edit_message_text(f"❌ No {cfg.token_symbol} to sell.", reply_markup=kb_back_main())
             return
-        stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
-        ctx.user_data["sell_balance"] = tok_bal
+        context.user_data["sell_balance"] = tok_bal
         await query.edit_message_text(
-            f"🔴 *Sell {cfg.token_symbol}*\n{DIVIDER}\n\n"
-            f"💰  Price:     *${stats.price_usd:.8f}*\n"
-            f"🪙  Balance:   *{tok_bal:,.4f} {cfg.token_symbol}*\n"
-            f"📐  Slippage:  *{user.slippage}%*\n\n"
-            f"Select percentage to sell:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_sell_pct(),
+            f"🔴 *Sell {cfg.token_symbol}*\n\nBalance: *{tok_bal:,.4f}*\n\nSelect %:",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_sell_pct(),
         )
 
     elif data.startswith("sell_pct:"):
         pct = float(data.split(":")[1]) / 100
-        amount = ctx.user_data.get("sell_balance", 0.0) * pct
+        amount = context.user_data.get("sell_balance", 0.0) * pct
         _pending_sell[uid] = amount
-        await _show_sell_confirm(query, ctx, uid, amount)
-
-    elif data == "sell_custom":
-        ctx.user_data["awaiting"] = "sell_amount"
-        await query.edit_message_text(
-            f"✏️ *Custom Sell Amount*\n{DIVIDER}\n\n"
-            f"Enter {cfg.token_symbol} amount to sell:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await _show_sell_confirm(query, context, uid, amount)
 
     elif data == "sell_confirm:confirm":
-        await _execute_sell(query, ctx, uid, username)
+        await _execute_sell(query, context, uid)
 
     elif data == "sell_confirm:cancel":
         _pending_sell.pop(uid, None)
-        await query.edit_message_text("✖ Sell cancelled.", reply_markup=kb_back_main())
-
-    elif data == "trade:transfer":
-        with get_session() as session:
-            user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet — send /start first.", reply_markup=kb_back_main())
-            return
-        ctx.user_data["awaiting"] = "transfer_to"
-        await query.edit_message_text(
-            f"↗️ *Transfer {cfg.token_symbol}*\n{DIVIDER}\n\n"
-            f"Enter the *recipient wallet address* (0x...):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-
-    elif data == "transfer_confirm:confirm":
-        await _execute_transfer(query, ctx, uid, username)
-
-    elif data == "transfer_confirm:cancel":
-        _pending_transfer_to.pop(uid, None)
-        ctx.user_data.pop("transfer_amount", None)
-        await query.edit_message_text("✖ Transfer cancelled.", reply_markup=kb_back_main())
+        await query.edit_message_text("❌ Sell cancelled.", reply_markup=kb_back_main())
 
     elif data == "trade:dca":
-        ctx.user_data["awaiting"] = "dca_total"
+        context.user_data["awaiting"] = "dca_total"
         await query.edit_message_text(
-            f"📈 *DCA — Dollar Cost Average*\n{DIVIDER}\n\n"
-            f"Split your buy into multiple orders over time.\n\n"
-            f"*Step 1/3:* Enter total ETH to spend (e.g. `0.5`):",
+            "📈 *DCA Setup*\n\nStep 1/3: Total ETH to spend (e.g. `0.5`):",
             parse_mode=ParseMode.MARKDOWN,
         )
 
     elif data == "trade:limit_buy":
         _pending_limit_type[uid] = "buy"
-        ctx.user_data["awaiting"] = "limit_amount"
-        await query.edit_message_text(
-            f"📉 *Limit Buy*\n{DIVIDER}\n\n"
-            f"Your order will execute automatically when the price drops to your target.\n\n"
-            f"Enter ETH amount to spend (e.g. `0.1`):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["awaiting"] = "limit_amount"
+        await query.edit_message_text("📉 *Limit Buy*\n\nEnter ETH amount:", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "trade:limit_sell":
         _pending_limit_type[uid] = "sell"
-        ctx.user_data["awaiting"] = "limit_amount"
-        await query.edit_message_text(
-            f"📉 *Limit Sell*\n{DIVIDER}\n\n"
-            f"Your order will execute automatically when the price rises to your target.\n\n"
-            f"Enter {cfg.token_symbol} amount to sell:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["awaiting"] = "limit_amount"
+        await query.edit_message_text("📉 *Limit Sell*\n\nEnter token amount:", parse_mode=ParseMode.MARKDOWN)
 
-    # ── Settings ──────────────────────────────────────────────────────────────
     elif data == "settings:toggle_monitor":
         with get_session() as session:
             user = _get_user(session, uid)
             user.monitor_enabled = not user.monitor_enabled
             session.commit()
-            await query.edit_message_text(
-                f"⚙️ *Settings*\n{DIVIDER}",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user),
-            )
+            await query.edit_message_text("⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user))
 
     elif data == "settings:toggle_broadcast":
         with get_session() as session:
             user = _get_user(session, uid)
             user.broadcast_enabled = not user.broadcast_enabled
             session.commit()
-            await query.edit_message_text(
-                f"⚙️ *Settings*\n{DIVIDER}",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user),
-            )
+            await query.edit_message_text("⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user))
 
     elif data == "settings:cycle_gas":
         strategies = ["slow", "medium", "fast"]
@@ -731,25 +725,15 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             idx = strategies.index(user.gas_strategy) if user.gas_strategy in strategies else 1
             user.gas_strategy = strategies[(idx + 1) % 3]
             session.commit()
-            await query.edit_message_text(
-                f"⚙️ *Settings*\n{DIVIDER}",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user),
-            )
+            await query.edit_message_text("⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN, reply_markup=kb_settings(user))
 
     elif data == "settings:slippage":
-        ctx.user_data["awaiting"] = "slippage"
-        await query.edit_message_text(
-            f"📐 *Slippage Tolerance*\n{DIVIDER}\n\n"
-            f"Enter slippage % (e.g. `1.5` for 1.5%):\nRecommended: 1–3%",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["awaiting"] = "slippage"
+        await query.edit_message_text("📐 Enter slippage % (e.g. `1.5`):", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "settings:default_eth":
-        ctx.user_data["awaiting"] = "default_eth"
-        await query.edit_message_text(
-            f"💰 *Default ETH Buy Amount*\n{DIVIDER}\n\nEnter amount in ETH (e.g. `0.05`):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        context.user_data["awaiting"] = "default_eth"
+        await query.edit_message_text("💰 Enter default ETH buy amount (e.g. `0.05`):", parse_mode=ParseMode.MARKDOWN)
 
     elif data == "settings:orders":
         with get_session() as session:
@@ -757,14 +741,11 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
                 select(LimitOrder).where(LimitOrder.user_id == uid, LimitOrder.status == "pending")
             ).all()
         if not orders:
-            await query.edit_message_text(
-                f"📋 *Pending Limit Orders*\n{DIVIDER}\n\nYou have no pending orders.",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-            )
+            await query.edit_message_text("📋 No pending orders.", reply_markup=kb_back_main())
         else:
             await query.edit_message_text(
-                f"📋 *Pending Limit Orders*\n{DIVIDER}\n\nTap an order to cancel it:",
-                parse_mode=ParseMode.MARKDOWN, reply_markup=kb_orders(orders),
+                "📋 *Pending Limit Orders*", parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_orders(orders),
             )
 
     elif data.startswith("cancel_order:"):
@@ -774,297 +755,85 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             if order and order.user_id == uid:
                 order.status = "cancelled"
                 session.commit()
-        await query.edit_message_text(
-            "✅ Order cancelled.", reply_markup=kb_back_main()
-        )
+        await query.edit_message_text("✅ Order cancelled.", reply_markup=kb_back_main())
 
 
-# ── Wallet creation helper ────────────────────────────────────────────────────
-
-async def _do_create_wallet(query, ctx, uid: int, username: str,
-                             cfg: Settings, replace: bool = False) -> None:
-    address, private_key, mnemonic = create_wallet()
-    encrypted_key = encrypt_secret(private_key, cfg.encryption_key)
-
-    with get_session() as session:
-        existing = _get_user(session, uid)
-        if existing:
-            if not replace:
-                await query.edit_message_text(
-                    "❌ You already have a wallet. Use Replace to overwrite.",
-                    reply_markup=kb_wallet_view(has_wallet=True),
-                )
-                return
-            existing.wallet_address = address
-            existing.encrypted_private_key = encrypted_key
-        else:
-            session.add(User(
-                telegram_id=uid, username=username,
-                wallet_address=address, encrypted_private_key=encrypted_key,
-                referral_code=make_referral_code(uid),
-            ))
-        session.commit()
-
-    action = "Replaced" if replace else "Created"
-    try:
-        await ctx.bot.send_message(
-            uid,
-            f"🔐 *Wallet {action} Successfully!*\n{DIVIDER}\n\n"
-            f"👛 *Address:*\n`{address}`\n\n"
-            f"🔑 *Private Key:*\n`{private_key}`\n\n"
-            f"🌱 *Seed Phrase:*\n`{mnemonic}`\n\n"
-            f"⚠️ *Back these up securely and delete this message.*\n"
-            f"Never share them with anyone.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as exc:
-        log.warning("Could not DM wallet info: %s", exc)
-
-    await notify_wallet_created(ctx.bot, cfg, username, uid, address)
-    await query.edit_message_text(
-        f"✅ *Wallet {action}!*\n{DIVIDER}\n\n"
-        f"📌 Address:\n`{address}`\n\n"
-        f"🔑 Your private key and seed phrase have been sent to your DM.\n"
-        f"[🔍 Explorer]({cfg.address_link(address)})",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-        reply_markup=kb_wallet_view(has_wallet=True),
-    )
-
-
-# ── Text message handler ──────────────────────────────────────────────────────
-
-async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
     uid = update.effective_user.id
-    username = update.effective_user.username or update.effective_user.first_name or "anon"
-    raw = update.effective_message.text or ""
-    text = raw.strip()
-    awaiting = ctx.user_data.get("awaiting")
-
-    # Always delete messages containing private keys / seeds (in private chat)
-    if update.effective_chat.type == "private" and awaiting in ("import_key", "import_seed"):
-        try:
-            await update.effective_message.delete()
-        except Exception:
-            pass
-
-    if awaiting == "import_key":
-        ctx.user_data.pop("awaiting", None)
-        try:
-            address, pk = import_from_private_key(text)
-        except Exception:
-            await update.effective_message.reply_text(
-                "❌ Invalid private key. Please check and try again.",
-                reply_markup=kb_back_main(),
-            )
-            return
-        encrypted = encrypt_secret(pk, cfg.encryption_key)
-        with get_session() as session:
-            existing = _get_user(session, uid)
-            if existing:
-                existing.wallet_address = address
-                existing.encrypted_private_key = encrypted
-            else:
-                session.add(User(
-                    telegram_id=uid, username=username,
-                    wallet_address=address, encrypted_private_key=encrypted,
-                    referral_code=make_referral_code(uid),
-                ))
-            session.commit()
-        await notify_wallet_imported(ctx.bot, cfg, username, uid, address, "Private Key")
-        await update.effective_message.reply_text(
-            f"✅ *Wallet Imported!*\n{DIVIDER}\n\n"
-            f"📌 Address:\n`{address}`\n\n"
-            f"[🔍 Explorer]({cfg.address_link(address)})",
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=kb_wallet_view(has_wallet=True),
-        )
-        return
-
-    if awaiting == "import_seed":
-        ctx.user_data.pop("awaiting", None)
-        try:
-            address, pk = import_from_mnemonic(text)
-        except Exception:
-            await update.effective_message.reply_text(
-                "❌ Invalid seed phrase. Please check and try again.",
-                reply_markup=kb_back_main(),
-            )
-            return
-        encrypted = encrypt_secret(pk, cfg.encryption_key)
-        with get_session() as session:
-            existing = _get_user(session, uid)
-            if existing:
-                existing.wallet_address = address
-                existing.encrypted_private_key = encrypted
-            else:
-                session.add(User(
-                    telegram_id=uid, username=username,
-                    wallet_address=address, encrypted_private_key=encrypted,
-                    referral_code=make_referral_code(uid),
-                ))
-            session.commit()
-        await notify_wallet_imported(ctx.bot, cfg, username, uid, address, "Seed Phrase")
-        await update.effective_message.reply_text(
-            f"✅ *Wallet Imported!*\n{DIVIDER}\n\n"
-            f"📌 Address:\n`{address}`\n\n"
-            f"[🔍 Explorer]({cfg.address_link(address)})",
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-            reply_markup=kb_wallet_view(has_wallet=True),
-        )
-        return
+    text = (update.effective_message.text or "").strip()
+    awaiting = context.user_data.get("awaiting")
 
     if awaiting == "buy_amount":
         try:
             eth_amt = float(text)
             assert eth_amt > 0
         except (ValueError, AssertionError):
-            await update.effective_message.reply_text("❌ Enter a positive number like `0.05`.")
+            await update.effective_message.reply_text("❌ Enter a positive number.")
             return
-        ctx.user_data.pop("awaiting", None)
+        context.user_data.pop("awaiting", None)
         _pending_buy[uid] = eth_amt
-        stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
+        cfg2 = _cfg(context)
+        stats = await fetch_market_stats(cfg2.contract_address, cfg2.explorer_url, chain)
         with get_session() as session:
             user = _get_user(session, uid)
             slip = user.slippage if user else 1.0
         expected = eth_amt / stats.price_eth if stats.price_eth > 0 else 0
         await update.effective_message.reply_text(
-            f"🟢 *Confirm Buy*\n{DIVIDER}\n\n"
-            f"  Spend:    `{eth_amt} ETH`\n"
-            f"  Receive:  ~`{expected:,.4f} {cfg.token_symbol}`\n"
-            f"  Slippage: `{slip}%`\n"
-            f"  Price:    `${stats.price_usd:.8f}`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_confirm_cancel("buy_confirm"),
+            f"🟢 *Confirm Buy*\n\nSpend: `{eth_amt} ETH`\nReceive: ~`{expected:,.4f} {cfg2.token_symbol}`\nSlippage: `{slip}%`",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_confirm_cancel("buy_confirm"),
         )
-        return
 
-    if awaiting == "sell_amount":
+    elif awaiting == "dca_total":
         try:
-            amount = float(text)
-            assert amount > 0
-        except (ValueError, AssertionError):
-            await update.effective_message.reply_text("❌ Enter a positive number.")
-            return
-        ctx.user_data.pop("awaiting", None)
-        _pending_sell[uid] = amount
-        await update.effective_message.reply_text(
-            f"🔴 *Confirm Sell*\n{DIVIDER}\n\n"
-            f"  Sell: `{amount:,.4f} {cfg.token_symbol}`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_confirm_cancel("sell_confirm"),
-        )
-        return
-
-    if awaiting == "transfer_to":
-        if not text.startswith("0x") or len(text) != 42:
-            await update.effective_message.reply_text(
-                "❌ Invalid address. Must be a 42-character hex address (0x...)."
-            )
-            return
-        _pending_transfer_to[uid] = text
-        ctx.user_data["awaiting"] = "transfer_amount"
-        await update.effective_message.reply_text(
-            f"↗️ *Transfer — Step 2/2*\n{DIVIDER}\n\n"
-            f"To: `{text}`\n\nEnter {cfg.token_symbol} amount to send:",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    if awaiting == "transfer_amount":
-        try:
-            amount = float(text)
-            assert amount > 0
-        except (ValueError, AssertionError):
-            await update.effective_message.reply_text("❌ Enter a positive number.")
-            return
-        to_addr = _pending_transfer_to.get(uid, "")
-        ctx.user_data["transfer_amount"] = amount
-        ctx.user_data.pop("awaiting", None)
-        await update.effective_message.reply_text(
-            f"↗️ *Confirm Transfer*\n{DIVIDER}\n\n"
-            f"  Send:  `{amount:,.4f} {cfg.token_symbol}`\n"
-            f"  To:    `{to_addr}`",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_confirm_cancel("transfer_confirm"),
-        )
-        return
-
-    if awaiting == "dca_total":
-        try:
-            ctx.user_data["dca_total"] = float(text)
+            context.user_data["dca_total"] = float(text)
         except ValueError:
-            await update.effective_message.reply_text("❌ Enter a number like `0.5`.")
+            await update.effective_message.reply_text("❌ Enter a number.")
             return
-        ctx.user_data["awaiting"] = "dca_buys"
-        await update.effective_message.reply_text(
-            f"📈 *DCA — Step 2/3*\n{DIVIDER}\n\nHow many *individual buys*? (e.g. `5`)",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+        context.user_data["awaiting"] = "dca_buys"
+        await update.effective_message.reply_text("Step 2/3: How many *buys*?", parse_mode=ParseMode.MARKDOWN)
 
-    if awaiting == "dca_buys":
+    elif awaiting == "dca_buys":
         try:
-            ctx.user_data["dca_buys"] = int(text)
+            context.user_data["dca_buys"] = int(text)
         except ValueError:
             await update.effective_message.reply_text("❌ Enter a whole number.")
             return
-        ctx.user_data["awaiting"] = "dca_interval"
-        await update.effective_message.reply_text(
-            f"📈 *DCA — Step 3/3*\n{DIVIDER}\n\nInterval in *minutes* between each buy? (e.g. `60`)",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+        context.user_data["awaiting"] = "dca_interval"
+        await update.effective_message.reply_text("Step 3/3: Interval in *minutes*?", parse_mode=ParseMode.MARKDOWN)
 
-    if awaiting == "dca_interval":
+    elif awaiting == "dca_interval":
         try:
             interval = int(text)
         except ValueError:
             await update.effective_message.reply_text("❌ Enter whole minutes.")
             return
-        import datetime as dt
-        total = ctx.user_data.get("dca_total", 0)
-        buys  = ctx.user_data.get("dca_buys", 1)
-        eth_per = round(total / buys, 6)
+        total = context.user_data.get("dca_total", 0)
+        buys  = context.user_data.get("dca_buys", 1)
         with get_session() as session:
             job = DCAJob(user_id=uid, total_eth=total, num_buys=buys,
-                         interval_minutes=interval, eth_per_buy=eth_per,
+                         interval_minutes=interval, eth_per_buy=total/buys,
                          next_run=dt.datetime.utcnow())
             session.add(job)
             session.commit()
             job_id = job.id
-        ctx.user_data.pop("awaiting", None)
+        context.user_data.pop("awaiting", None)
         await update.effective_message.reply_text(
-            f"✅ *DCA Scheduled!*\n{DIVIDER}\n\n"
-            f"  Total:    `{total} ETH`\n"
-            f"  Orders:   `{buys}` × `{eth_per} ETH`\n"
-            f"  Interval: every `{interval}` minutes\n"
-            f"  Job ID:   `{job_id}`\n\n"
-            f"I'll notify you after each buy.",
+            f"✅ *DCA Scheduled!*\n\n`{total} ETH` × {buys} buys every {interval}min\nJob ID: `{job_id}`",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
-        return
 
-    if awaiting == "limit_amount":
+    elif awaiting == "limit_amount":
         try:
             _pending_limit_amount[uid] = float(text)
         except ValueError:
             await update.effective_message.reply_text("❌ Invalid amount.")
             return
-        ctx.user_data["awaiting"] = "limit_price"
-        order_type = _pending_limit_type.get(uid, "buy")
-        await update.effective_message.reply_text(
-            f"📉 *Limit {order_type.title()} — Step 2/2*\n{DIVIDER}\n\n"
-            f"Enter the *USD price target* to trigger (e.g. `0.000005`):",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+        context.user_data["awaiting"] = "limit_price"
+        await update.effective_message.reply_text("Enter *USD price target* (e.g. `0.000005`):", parse_mode=ParseMode.MARKDOWN)
 
-    if awaiting == "limit_price":
+    elif awaiting == "limit_price":
         try:
             price = float(text)
         except ValueError:
@@ -1077,109 +846,139 @@ async def text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                    token_address=cfg.contract_address,
                                    amount=amount, price_target=price))
             session.commit()
-        ctx.user_data.pop("awaiting", None)
-        unit = "ETH" if order_type == "buy" else cfg.token_symbol
+        context.user_data.pop("awaiting", None)
         await update.effective_message.reply_text(
-            f"✅ *Limit {order_type.title()} Set!*\n{DIVIDER}\n\n"
-            f"  Amount:  `{amount} {unit}`\n"
-            f"  Trigger: `${price:.8f}`\n\n"
-            f"I'll execute automatically when the price hits your target.",
+            f"✅ *Limit {order_type.title()} set!*\n\nAmount: `{amount}`\nTrigger: `${price:.8f}`",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
         )
-        return
 
-    if awaiting == "slippage":
+    elif awaiting == "slippage":
         try:
             slip = float(text)
             assert 0.1 <= slip <= 50
         except (ValueError, AssertionError):
-            await update.effective_message.reply_text("❌ Enter a value between 0.1 and 50.")
+            await update.effective_message.reply_text("❌ Enter 0.1–50.")
             return
         with get_session() as session:
             user = _get_user(session, uid)
             user.slippage = slip
             session.commit()
-        ctx.user_data.pop("awaiting", None)
-        await update.effective_message.reply_text(
-            f"✅ Slippage set to *{slip}%*",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-        )
-        return
+        context.user_data.pop("awaiting", None)
+        await update.effective_message.reply_text(f"✅ Slippage set to *{slip}%*",
+                                                   parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
 
-    if awaiting == "default_eth":
+    elif awaiting == "default_eth":
         try:
             amt = float(text)
-            assert amt > 0
-        except (ValueError, AssertionError):
-            await update.effective_message.reply_text("❌ Invalid amount.")
+        except ValueError:
+            await update.effective_message.reply_text("❌ Invalid.")
             return
         with get_session() as session:
             user = _get_user(session, uid)
             user.default_eth_amount = amt
             session.commit()
-        ctx.user_data.pop("awaiting", None)
-        await update.effective_message.reply_text(
-            f"✅ Default buy set to *{amt} ETH*",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-        )
-        return
+        context.user_data.pop("awaiting", None)
+        await update.effective_message.reply_text(f"✅ Default buy: *{amt} ETH*",
+                                                   parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
 
-    # Not in a conversation — moderate group messages
-    await moderate(update, ctx)
+    elif awaiting == "import_key":
+        context.user_data.pop("awaiting", None)
+        if not _is_admin(uid, cfg):
+            return
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+        raw_key = text.strip()
+        try:
+            account = Account.from_key(raw_key)
+            address = account.address
+        except Exception:
+            await update.effective_message.reply_text("❌ Not a valid private key. Try again from Wallet menu.")
+            return
+        encrypted = encrypt_secret(raw_key, cfg.encryption_key)
+        with get_session() as session:
+            user = _get_user(session, uid)
+            if not user:
+                await update.effective_message.reply_text("No account — send /start first.")
+                return
+            user.wallet_address = address
+            user.encrypted_private_key = encrypted
+            session.commit()
+        await _send_wallet_dm(context, uid, cfg, address, raw_key, "WALLET IMPORTED")
+
+    elif awaiting == "import_seed":
+        context.user_data.pop("awaiting", None)
+        if not _is_admin(uid, cfg):
+            return
+        try:
+            await update.effective_message.delete()
+        except Exception:
+            pass
+        phrase = text.strip()
+        try:
+            Account.enable_unaudited_hdwallet_features()
+            account = Account.from_mnemonic(phrase)
+            address = account.address
+            raw_key = account.key.hex()
+        except Exception:
+            await update.effective_message.reply_text("❌ Not a valid seed phrase. Try again from Wallet menu.")
+            return
+        encrypted = encrypt_secret(raw_key, cfg.encryption_key)
+        with get_session() as session:
+            user = _get_user(session, uid)
+            if not user:
+                await update.effective_message.reply_text("No account — send /start first.")
+                return
+            user.wallet_address = address
+            user.encrypted_private_key = encrypted
+            session.commit()
+        await _send_wallet_dm(context, uid, cfg, address, raw_key, "WALLET IMPORTED")
+
+    else:
+        await moderate(update, context)
 
 
-# ── Trade execution helpers ───────────────────────────────────────────────────
-
-async def _show_buy_confirm(query, ctx, uid: int, eth_amt: float) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def _show_buy_confirm(query, context, uid: int, eth_amt: float) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
     stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
     with get_session() as session:
         user = _get_user(session, uid)
         slip = user.slippage if user else 1.0
     expected = eth_amt / stats.price_eth if stats.price_eth > 0 else 0
     await query.edit_message_text(
-        f"🟢 *Confirm Buy*\n{DIVIDER}\n\n"
-        f"  Spend:    `{eth_amt} ETH`\n"
-        f"  Receive:  ~`{expected:,.4f} {cfg.token_symbol}`\n"
-        f"  Slippage: `{slip}%`\n"
-        f"  Price:    `${stats.price_usd:.8f}`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_confirm_cancel("buy_confirm"),
+        f"🟢 *Confirm Buy*\n\nSpend: `{eth_amt} ETH`\nReceive: ~`{expected:,.4f} {cfg.token_symbol}`\nSlippage: `{slip}%`\nPrice: `${stats.price_usd:.8f}`",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb_confirm_cancel("buy_confirm"),
     )
 
 
-async def _show_sell_confirm(query, ctx, uid: int, amount: float) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def _show_sell_confirm(query, context, uid: int, amount: float) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
     stats = await fetch_market_stats(cfg.contract_address, cfg.explorer_url, chain)
     with get_session() as session:
         user = _get_user(session, uid)
         slip = user.slippage if user else 1.0
     expected_eth = amount * stats.price_eth
     await query.edit_message_text(
-        f"🔴 *Confirm Sell*\n{DIVIDER}\n\n"
-        f"  Sell:     `{amount:,.4f} {cfg.token_symbol}`\n"
-        f"  Receive:  ~`{expected_eth:.6f} ETH`\n"
-        f"  Slippage: `{slip}%`\n"
-        f"  Price:    `${stats.price_usd:.8f}`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb_confirm_cancel("sell_confirm"),
+        f"🔴 *Confirm Sell*\n\nSell: `{amount:,.4f} {cfg.token_symbol}`\nReceive: ~`{expected_eth:.6f} ETH`\nSlippage: `{slip}%`\nPrice: `${stats.price_usd:.8f}`",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb_confirm_cancel("sell_confirm"),
     )
 
 
-async def _execute_buy(query, ctx, uid: int, username: str) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def _execute_buy(query, context, uid: int) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
     eth_amt = _pending_buy.pop(uid, None)
     if eth_amt is None:
-        await query.edit_message_text("❌ Session expired. Try again.", reply_markup=kb_back_main())
+        await query.edit_message_text("❌ Session expired.", reply_markup=kb_back_main())
         return
-    await query.edit_message_text("⏳ *Executing buy...*\n\nPlease wait.", parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text("⏳ Executing buy...")
     with get_session() as session:
         user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet found.", reply_markup=kb_back_main())
+            await query.edit_message_text("No wallet.", reply_markup=kb_back_main())
             return
         pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
         addr, slip, gas, broadcast = user.wallet_address, user.slippage, user.gas_strategy, user.broadcast_enabled
@@ -1187,55 +986,40 @@ async def _execute_buy(query, ctx, uid: int, username: str) -> None:
     result = await chain.buy_error(addr, pk, eth_amt, slip, gas)
     if result.success:
         with get_session() as session:
-            session.add(Transaction(
-                wallet_address=addr, tx_hash=result.tx_hash, tx_type="buy",
-                amount=result.amount_out, token_symbol=cfg.token_symbol,
-                token_contract=cfg.contract_address, broadcasted=broadcast,
-            ))
+            session.add(Transaction(wallet_address=addr, tx_hash=result.tx_hash, tx_type="buy",
+                                    amount=result.amount_out, token_symbol=cfg.token_symbol,
+                                    token_contract=cfg.contract_address, broadcasted=broadcast))
             session.commit()
-        tx_link = cfg.tx_link(result.tx_hash)
         await query.edit_message_text(
-            f"✅ *Buy Successful!*\n{DIVIDER}\n\n"
-            f"  Spent:    `{eth_amt} ETH`\n"
-            f"  Received: ~`{result.amount_out:,.4f} {cfg.token_symbol}`\n\n"
-            f"[🔍 View Transaction]({tx_link})\n\n{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-            reply_markup=kb_back_main(),
+            f"✅ *Buy Successful!*\n\nSpent: `{eth_amt} ETH`\nReceived: ~`{result.amount_out:,.4f} {cfg.token_symbol}`\n[View Tx]({cfg.tx_link(result.tx_hash)})\n\n{cfg.branding}",
+            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=kb_back_main(),
         )
-        await notify_trade(ctx.bot, cfg, username, "BUY",
-                           f"{eth_amt} ETH → {result.amount_out:,.4f} {cfg.token_symbol}",
-                           addr, result.tx_hash)
         if broadcast:
             try:
-                await ctx.bot.send_message(
+                await context.bot.send_message(
                     cfg.group_chat_id,
-                    f"🟢 *@{username}* BOUGHT "
-                    f"`{result.amount_out:,.4f} {cfg.token_symbol}` "
-                    f"for `{eth_amt} ETH`\n[Tx]({tx_link})\n{cfg.branding}",
+                    f"🟢 @{query.from_user.username or uid} BOUGHT `{result.amount_out:,.4f} {cfg.token_symbol}` for `{eth_amt} ETH` [Tx]({cfg.tx_link(result.tx_hash)})\n{cfg.branding}",
                     parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
                 )
             except Exception:
                 pass
     else:
-        await query.edit_message_text(
-            f"❌ *Buy Failed*\n{DIVIDER}\n\n`{result.error}`\n\n"
-            f"Check your ETH balance and try again.",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-        )
+        await query.edit_message_text(f"❌ *Buy Failed*\n\n`{result.error}`",
+                                       parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
 
 
-async def _execute_sell(query, ctx, uid: int, username: str) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
+async def _execute_sell(query, context, uid: int) -> None:
+    cfg = _cfg(context)
+    chain = _chain(context)
     token_amt = _pending_sell.pop(uid, None)
     if token_amt is None:
-        await query.edit_message_text("❌ Session expired. Try again.", reply_markup=kb_back_main())
+        await query.edit_message_text("❌ Session expired.", reply_markup=kb_back_main())
         return
-    await query.edit_message_text("⏳ *Executing sell...*\n\nPlease wait.", parse_mode=ParseMode.MARKDOWN)
+    await query.edit_message_text("⏳ Executing sell...")
     with get_session() as session:
         user = _get_user(session, uid)
         if not user:
-            await query.edit_message_text("No wallet found.", reply_markup=kb_back_main())
+            await query.edit_message_text("No wallet.", reply_markup=kb_back_main())
             return
         pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
         addr, slip, gas, broadcast = user.wallet_address, user.slippage, user.gas_strategy, user.broadcast_enabled
@@ -1243,146 +1027,66 @@ async def _execute_sell(query, ctx, uid: int, username: str) -> None:
     result = await chain.sell_error(addr, pk, token_amt, slip, gas)
     if result.success:
         with get_session() as session:
-            session.add(Transaction(
-                wallet_address=addr, tx_hash=result.tx_hash, tx_type="sell",
-                amount=token_amt, token_symbol=cfg.token_symbol,
-                token_contract=cfg.contract_address, broadcasted=broadcast,
-            ))
+            session.add(Transaction(wallet_address=addr, tx_hash=result.tx_hash, tx_type="sell",
+                                    amount=token_amt, token_symbol=cfg.token_symbol,
+                                    token_contract=cfg.contract_address, broadcasted=broadcast))
             session.commit()
-        tx_link = cfg.tx_link(result.tx_hash)
         await query.edit_message_text(
-            f"✅ *Sell Successful!*\n{DIVIDER}\n\n"
-            f"  Sold:     `{token_amt:,.4f} {cfg.token_symbol}`\n"
-            f"  Received: ~`{result.amount_out:.6f} ETH`\n\n"
-            f"[🔍 View Transaction]({tx_link})\n\n{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-            reply_markup=kb_back_main(),
+            f"✅ *Sell Successful!*\n\nSold: `{token_amt:,.4f} {cfg.token_symbol}`\nReceived: ~`{result.amount_out:.6f} ETH`\n[View Tx]({cfg.tx_link(result.tx_hash)})\n\n{cfg.branding}",
+            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, reply_markup=kb_back_main(),
         )
-        await notify_trade(ctx.bot, cfg, username, "SELL",
-                           f"{token_amt:,.4f} {cfg.token_symbol} → {result.amount_out:.6f} ETH",
-                           addr, result.tx_hash)
         if broadcast:
             try:
-                await ctx.bot.send_message(
+                await context.bot.send_message(
                     cfg.group_chat_id,
-                    f"🔴 *@{username}* SOLD "
-                    f"`{token_amt:,.4f} {cfg.token_symbol}` "
-                    f"→ `{result.amount_out:.6f} ETH`\n[Tx]({tx_link})\n{cfg.branding}",
+                    f"🔴 @{query.from_user.username or uid} SOLD `{token_amt:,.4f} {cfg.token_symbol}` → `{result.amount_out:.6f} ETH` [Tx]({cfg.tx_link(result.tx_hash)})\n{cfg.branding}",
                     parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
                 )
             except Exception:
                 pass
     else:
-        await query.edit_message_text(
-            f"❌ *Sell Failed*\n{DIVIDER}\n\n`{result.error}`",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-        )
-
-
-async def _execute_transfer(query, ctx, uid: int, username: str) -> None:
-    cfg = _cfg(ctx)
-    chain = _chain(ctx)
-    to_addr = _pending_transfer_to.pop(uid, None)
-    amount = ctx.user_data.pop("transfer_amount", None)
-    if not to_addr or not amount:
-        await query.edit_message_text("❌ Session expired. Try again.", reply_markup=kb_back_main())
-        return
-    await query.edit_message_text("⏳ *Sending transfer...*\n\nPlease wait.", parse_mode=ParseMode.MARKDOWN)
-    with get_session() as session:
-        user = _get_user(session, uid)
-        if not user:
-            await query.edit_message_text("No wallet found.", reply_markup=kb_back_main())
-            return
-        pk = decrypt_secret(user.encrypted_private_key, cfg.encryption_key)
-        addr, gas = user.wallet_address, user.gas_strategy
-
-    result = await chain.send_token(addr, pk, to_addr, amount, gas)
-    if result.success:
-        tx_link = cfg.tx_link(result.tx_hash)
-        with get_session() as session:
-            session.add(Transaction(
-                wallet_address=addr, tx_hash=result.tx_hash, tx_type="send",
-                amount=amount, token_symbol=cfg.token_symbol, token_contract=cfg.contract_address,
-            ))
-            session.commit()
-        await query.edit_message_text(
-            f"✅ *Transfer Successful!*\n{DIVIDER}\n\n"
-            f"  Sent:  `{amount:,.4f} {cfg.token_symbol}`\n"
-            f"  To:    `{to_addr}`\n\n"
-            f"[🔍 View Transaction]({tx_link})\n\n{cfg.branding}",
-            parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True,
-            reply_markup=kb_back_main(),
-        )
-    else:
-        await query.edit_message_text(
-            f"❌ *Transfer Failed*\n{DIVIDER}\n\n`{result.error}`",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main(),
-        )
+        await query.edit_message_text(f"❌ *Sell Failed*\n\n`{result.error}`",
+                                       parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_main())
 
 
 # ── Moderation ────────────────────────────────────────────────────────────────
 
-async def moderate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
+async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = _cfg(context)
     msg = update.effective_message
     if not msg or not msg.text or update.effective_chat.type == "private":
         return
     uid = update.effective_user.id
+    if _is_admin(uid, cfg):
+        return  # never moderate admins
+
+    with get_session() as session:
+        gs = _get_group_settings(session, cfg.group_chat_id)
+        if not gs.moderation_enabled:
+            return
+
     text = msg.text.strip()
-    reason = None
-    if len(URL_RE.findall(text)) > MAX_URLS:
-        reason = "too many links"
-    _recent[uid].append(text.lower())
-    if list(_recent[uid]).count(text.lower()) > REPEAT_LIMIT:
-        reason = "repeated spam"
-    found = ADDRESS_RE.findall(text)
-    if found and any(a.lower() != cfg.contract_address.lower() for a in found):
-        reason = "unverified contract address"
-    if not reason:
+    username = update.effective_user.username or ""
+
+    result = moderation.classify(text, cfg.group_chat_id)
+    reason, severity = result if result else (None, None)
+
+    if reason is None:
+        if moderation.record_and_check_flood(uid):
+            reason, severity = "message flooding", "mute"
+        elif moderation.record_and_check_repeat(uid, text):
+            reason, severity = "repeated spam", "warn"
+
+    if reason is None:
         return
+
     try:
         await msg.delete()
     except Exception:
         pass
-    _strikes[uid] += 1
-    warn = (
-        f"🚫 @{update.effective_user.username or uid} — 3 strikes ({reason}). Admins please review."
-        if _strikes[uid] >= 3
-        else f"⚠️ @{update.effective_user.username or uid} — message removed ({reason}). Strike {_strikes[uid]}/3."
-    )
-    try:
-        await ctx.bot.send_message(cfg.group_chat_id, warn)
-    except Exception:
-        pass
+
+    await moderation.apply_action(context, cfg, cfg.group_chat_id, uid, username, reason, severity)
 
 
-async def welcome_new_members(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = _cfg(ctx)
-    for member in update.message.new_chat_members or []:
-        if member.is_bot:
-            continue
-        try:
-            await ctx.bot.send_message(
-                member.id,
-                f"👋 *Welcome to Error404, {member.first_name}!*\n{DIVIDER}\n\n"
-                f"You've just joined the *{cfg.token_symbol}* community on Robinhood Chain.\n\n"
-                f"Tap /start to get your free on-chain wallet and start trading!\n\n"
-                f"🌐 [error404.world]({cfg.project_website})\n"
-                f"🐦 [Twitter](https://x.com/erro404hood)\n"
-                f"💬 [Telegram Group](https://t.me/error404groupofficial)\n\n"
-                f"{DISCLAIMER}",
-                parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            try:
-                await update.message.reply_text(
-                    f"👋 Welcome @{member.username or member.first_name}! "
-                    f"DM me /start to claim your free wallet.\n{cfg.branding_plain}"
-                )
-            except Exception:
-                pass
-
-
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Unhandled error: %s", ctx.error)
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.exception("Unhandled error: %s", context.error)
